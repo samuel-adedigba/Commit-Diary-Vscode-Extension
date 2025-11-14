@@ -1,0 +1,88 @@
+{
+  "name": "commitdiary-extension",
+  "displayName": "Commit Diary",
+  "description": "Track, categorize, and analyze your Git commits directly in VS Code.",
+  "version": "0.0.1",
+  "publisher": "samuel-adedigba",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "prebuild": "pnpm -w --filter @commitdiary/core build",
+    "build": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "package": "vsce package",
+    "vscode:prepublish": "pnpm run build",
+    "dev": "pnpm run watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.75.0",
+    "vsce": "^2.15.0"
+  },
+  "dependencies": {
+    "simple-git": "^3.20.0",
+    "@commitdiary/core": "workspace:*"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "commitDiary.discoverRepos",
+        "title": "CommitDiary: Discover Repositories"
+      },
+      {
+        "command": "commitDiary.showMyCommits",
+        "title": "CommitDiary: Show My Commits"
+      },
+      {
+        "command": "commitDiary.refreshCount",
+        "title": "CommitDiary: Refresh Commit Count"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "commitDiary.discoverRepos",
+          "when": "true"
+        },
+        {
+          "command": "commitDiary.showMyCommits",
+          "when": "true"
+        },
+        {
+          "command": "commitDiary.refreshCount",
+          "when": "true"
+        }
+      ]
+    },
+      "configuration": {
+        "title": "CommitDiary",
+        "properties": {
+          "commitDiary.user.emails": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "markdownDescription": "Email(s) to identify 'my commits'. If empty, CommitDiary reads git config user.email and discovers emails for your user.name in this repo."
+          },
+          "commitDiary.debounceDelay": {
+            "type": "number",
+            "default": 2000,
+            "markdownDescription": "Debounce delay in milliseconds for status bar updates on Git repository changes."
+          }
+        }
+      }
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:commitDiary.discoverRepos",
+    "onCommand:commitDiary.showMyCommits",
+    "onCommand:commitDiary.refreshCount"
+  ]
+}

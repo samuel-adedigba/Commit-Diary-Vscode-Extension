@@ -1,0 +1,35 @@
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//               "name": "Run Extension (CommitDiary)",
+//             "type": "extensionHost",
+//             "request": "launch",
+//             "runtimeExecutable": "${execPath}",
+//             "args": [
+//                 "--extensionDevelopmentPath=${workspaceFolder}"
+//             ],
+//             "outFiles": [
+//                 "${workspaceFolder}/out/**/*.js"
+//             ],
+//             "preLaunchTask": "npm: compile"
+//         }
+//     ]
+// }
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Extension (CommitDiary)",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": [
+                "--extensionDevelopmentPath=${workspaceFolder}/packages/extension"
+            ],
+            "outFiles": [
+                "${workspaceFolder}/packages/extension/dist/**/*.js"
+            ],
+            "preLaunchTask": "Build CommitDiary Extension"
+        }
+    ]
+}

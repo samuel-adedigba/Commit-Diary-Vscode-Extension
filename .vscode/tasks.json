@@ -1,0 +1,29 @@
+// {
+// 	"version": "2.0.0",
+// 	"tasks": [
+// 		{
+// 			"type": "npm",
+// 			"script": "build",
+// 			"path": "packages/extension",
+// 			"group": "build",
+// 			"problemMatcher": [],
+// 			"label": "npm: build - packages/extension",
+// 			"detail": "tsc -p ."
+// 		}
+// 	]
+// }
+
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build CommitDiary Extension",
+            "type": "shell",
+            "command": "pnpm -w --filter @commitdiary/core build && pnpm --filter commitdiary-extension run build",
+            "group": "build",
+            "problemMatcher": [
+                "$tsc"
+            ]
+        }
+    ]
+}

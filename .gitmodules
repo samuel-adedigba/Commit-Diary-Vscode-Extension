@@ -1,0 +1,3 @@
+[submodule "packages/web-dashboard"]
+	path = packages/web-dashboard
+	url = https://github.com/samuel-adedigba/commitdiary-web.git
