@@ -4,11 +4,11 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 // main entry point
 const vscode = require("vscode");
-const core_1 = require("@commitdiary/core"); // adjust if local
 const repoDiscovery_1 = require("./repoDiscovery");
 const userIdentity_1 = require("./userIdentity");
 const simple_git_1 = require("simple-git");
 const gitLog_1 = require("./gitLog");
+const categorizer_1 = require("./categorizer");
 // Status bar item for real-time commit count display
 let statusBarItem;
 // Debounce timeout for status bar updates
@@ -17,6 +17,8 @@ let debounceTimer = null;
 let gitWatcher = null;
 // Current repo root for watcher
 let currentRepoRoot = null;
+// Commit cache Map: repoPath -> CommitCache (supports multiple workspaces)
+const commitCacheMap = new Map();
 async function activate(context) {
     const output = vscode.window.createOutputChannel("CommitDiary");
     output.appendLine("CommitDiary activated!");
@@ -33,6 +35,25 @@ async function activate(context) {
         }
     });
     context.subscriptions.push(workspaceWatcher);
+    // Auto-invalidate cache when configuration changes
+    const configWatcher = vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('commitDiary.defaultTimeRange') ||
+            e.affectsConfiguration('commitDiary.user.emails')) {
+            output.appendLine('[Debug] Configuration changed, clearing cache...');
+            commitCacheMap.clear();
+            updateStatusBar();
+        }
+    });
+    context.subscriptions.push(configWatcher);
+    // Auto-fetch on activation if workspace has a Git repo
+    const initialRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (initialRoot) {
+        const git = (0, simple_git_1.default)(initialRoot);
+        if (await git.checkIsRepo()) {
+            setupGitWatcher(initialRoot);
+            updateStatusBar();
+        }
+    }
     // Function to setup or update git watcher for a repo
     function setupGitWatcher(repoRoot) {
         // Dispose old watcher if any
@@ -62,20 +83,47 @@ async function activate(context) {
             return;
         try {
             const git = (0, simple_git_1.default)(currentRepoRoot);
-            let emails = await (0, userIdentity_1.getUserEmails)(currentRepoRoot);
-            let name = await (0, userIdentity_1.getUserName)(currentRepoRoot);
-            // Use simple discovery for status bar
-            if (emails.length === 0 && name) {
-                const discovered = await (0, userIdentity_1.discoverRepoEmailsForName)(currentRepoRoot, name);
-                if (discovered.length)
-                    emails = discovered;
+            const config = vscode.workspace.getConfiguration('commitDiary');
+            const timeRange = config.get('defaultTimeRange', '1 year');
+            // Get current HEAD SHA for cache validation
+            const currentHeadSHA = await git.revparse(['HEAD']);
+            // Check if cache is valid
+            const cachedData = commitCacheMap.get(currentRepoRoot);
+            const isCacheValid = cachedData &&
+                cachedData.headSHA === currentHeadSHA &&
+                cachedData.timeRange === timeRange;
+            let commits;
+            if (isCacheValid && cachedData) {
+                // Use cached data
+                commits = cachedData.commits;
             }
-            if (emails.length === 0 && !name)
-                return; // No identity
-            const identityRegex = (0, userIdentity_1.buildIdentityRegex)(emails, name ? [name] : []);
-            let commits = await (0, gitLog_1.getCommitsByIdentity)(currentRepoRoot, identityRegex, 500, 'author');
-            if (commits.length === 0) {
-                commits = await (0, gitLog_1.getCommitsByIdentity)(currentRepoRoot, identityRegex, 500, 'committer');
+            else {
+                // Fetch fresh data
+                let emails = await (0, userIdentity_1.getUserEmails)(currentRepoRoot);
+                let name = await (0, userIdentity_1.getUserName)(currentRepoRoot);
+                // Use simple discovery for status bar
+                if (emails.length === 0 && name) {
+                    const discovered = await (0, userIdentity_1.discoverRepoEmailsForName)(currentRepoRoot, name);
+                    if (discovered.length)
+                        emails = discovered;
+                }
+                if (emails.length === 0 && !name)
+                    return; // No identity
+                const identityRegex = (0, userIdentity_1.buildIdentityRegex)(emails, name ? [name] : []);
+                commits = await (0, gitLog_1.getCommitsByIdentity)(currentRepoRoot, identityRegex, 500, 'author', false, timeRange);
+                if (commits.length === 0) {
+                    commits = await (0, gitLog_1.getCommitsByIdentity)(currentRepoRoot, identityRegex, 500, 'committer', false, timeRange);
+                }
+                // Update cache only if we have commits (don't cache empty/bad results)
+                if (commits.length > 0) {
+                    commitCacheMap.set(currentRepoRoot, {
+                        repoPath: currentRepoRoot,
+                        headSHA: currentHeadSHA,
+                        commits,
+                        timestamp: Date.now(),
+                        timeRange
+                    });
+                }
             }
             statusBarItem.text = `$(git-commit) 😀 ${commits.length} commits`;
             statusBarItem.tooltip = "Click to view your commits 😀";
@@ -116,25 +164,55 @@ async function activate(context) {
         }
         const identityRegex = (0, userIdentity_1.buildIdentityRegex)(emails, name ? [name] : []);
         output.appendLine(`[Debug] Identity regex: ${identityRegex}`);
-        // Try author first
-        let commits = await (0, gitLog_1.getCommitsByIdentity)(root, identityRegex, 500, 'author', true);
-        // If none, try committer (some merges or rebases may reflect as committer)
-        if (commits.length === 0) {
-            output.appendLine(`[Debug] No author matches, trying committer…`);
-            commits = await (0, gitLog_1.getCommitsByIdentity)(root, identityRegex, 500, 'committer', true);
+        // Get configuration for time range
+        const config = vscode.workspace.getConfiguration('commitDiary');
+        const timeRange = config.get('defaultTimeRange', '1 year');
+        output.appendLine(`[Debug] Using timeRange: ${timeRange}`);
+        // Get current HEAD SHA for cache validation
+        const currentHeadSHA = await git.revparse(['HEAD']);
+        // Check if cache is valid
+        const cachedData = commitCacheMap.get(root);
+        const isCacheValid = cachedData &&
+            cachedData.headSHA === currentHeadSHA &&
+            cachedData.timeRange === timeRange;
+        let commits;
+        if (isCacheValid && cachedData) {
+            output.appendLine(`[Debug] Using cached data (HEAD: ${currentHeadSHA.substring(0, 8)})`);
+            commits = cachedData.commits;
+        }
+        else {
+            output.appendLine(`[Debug] Fetching fresh data from repository...`);
+            // Try author first
+            commits = await (0, gitLog_1.getCommitsByIdentity)(root, identityRegex, 500, 'author', true, timeRange);
+            // If none, try committer (some merges or rebases may reflect as committer)
+            if (commits.length === 0) {
+                output.appendLine(`[Debug] No author matches, trying committer…`);
+                commits = await (0, gitLog_1.getCommitsByIdentity)(root, identityRegex, 500, 'committer', true, timeRange);
+            }
+            // Update cache only if we have commits (don't cache empty/bad results)
+            if (commits.length > 0) {
+                commitCacheMap.set(root, {
+                    repoPath: root,
+                    headSHA: currentHeadSHA,
+                    commits,
+                    timestamp: Date.now(),
+                    timeRange
+                });
+            }
         }
         output.appendLine(`[Debug] Fetched ${commits.length} commit(s) for identity=${identityRegex}.`);
         for (const c of commits) {
-            const cat = (0, core_1.categorizeCommit)(c.message);
-            output.appendLine(`${c.date} — [${cat}] ${c.message}  <${c.authorEmail}>`);
+            const analysis = (0, categorizer_1.categorizeCommit)(c.message);
+            output.appendLine(`${c.date} — ${analysis.enhancedMessage}  -[${analysis.category}] ${analysis.originalMessage}`);
             for (const file of c.files) {
                 output.appendLine(`  + ${file}`);
             }
         }
         output.show(true);
         if (commits.length === 0) {
-            output.appendLine(`[Hint] Run: git -C "${root}" shortlog -sne --all --since '1 year ago' (check which email(s)/name(s) appear in history)`);
-            vscode.window.showInformationMessage('No commits matched your identity in the last year. Consider adding all your emails in Settings: commitDiary.user.emails, or check if your identity is configured correctly.');
+            const hintSince = timeRange === 'all' ? 'entire history' : timeRange + ' ago';
+            output.appendLine(`[Hint] Run: git -C "${root}" shortlog -sne --all --since '${timeRange} ago' (check which email(s)/name(s) appear in history)`);
+            vscode.window.showInformationMessage(`No commits matched your identity in the ${hintSince}. Consider adding all your emails in Settings: commitDiary.user.emails, or check if your identity is configured correctly.`);
         }
     });
     context.subscriptions.push(showMyCommits);
@@ -149,6 +227,20 @@ async function activate(context) {
         }
     });
     context.subscriptions.push(refresh);
+    const clearCache = vscode.commands.registerCommand('commitDiary.clearCache', async () => {
+        const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!root) {
+            vscode.window.showWarningMessage("CommitDiary: No workspace open.");
+            return;
+        }
+        const cacheSize = commitCacheMap.size;
+        commitCacheMap.clear();
+        output.appendLine(`[Debug] Cleared ${cacheSize} cached repo(s)`);
+        output.show(true);
+        await updateStatusBar();
+        vscode.window.showInformationMessage("CommitDiary: Cache cleared and refreshed.");
+    });
+    context.subscriptions.push(clearCache);
     const discover = vscode.commands.registerCommand('commitDiary.discoverRepos', async () => {
         try {
             const repos = await (0, repoDiscovery_1.discoverRepositories)();

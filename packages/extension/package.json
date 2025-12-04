@@ -42,6 +42,10 @@
       {
         "command": "commitDiary.refreshCount",
         "title": "CommitDiary: Refresh Commit Count"
+      },
+      {
+        "command": "commitDiary.clearCache",
+        "title": "CommitDiary: Clear Cache"
       }
     ],
     "menus": {
@@ -56,6 +60,10 @@
         },
         {
           "command": "commitDiary.refreshCount",
+          "when": "true"
+        },
+        {
+          "command": "commitDiary.clearCache",
           "when": "true"
         }
       ]
@@ -75,6 +83,12 @@
             "type": "number",
             "default": 2000,
             "markdownDescription": "Debounce delay in milliseconds for status bar updates on Git repository changes."
+          },
+          "commitDiary.defaultTimeRange": {
+            "type": "string",
+            "enum": ["1 week", "1 month", "3 months", "6 months", "1 year", "2 years", "all"],
+            "default": "1 year",
+            "markdownDescription": "Default time range for fetching commits. Use 'all' to fetch entire history (may be slow on large repositories)."
           }
         }
       }
@@ -83,6 +97,7 @@
     "onStartupFinished",
     "onCommand:commitDiary.discoverRepos",
     "onCommand:commitDiary.showMyCommits",
-    "onCommand:commitDiary.refreshCount"
+    "onCommand:commitDiary.refreshCount",
+    "onCommand:commitDiary.clearCache"
   ]
 }

@@ -2,19 +2,20 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getCommitsByIdentity = getCommitsByIdentity;
 const simple_git_1 = require("simple-git");
-async function getCommitsByIdentity(repoRoot, identityRegex, maxCount = 50, field = 'author', includeFiles = false) {
+async function getCommitsByIdentity(repoRoot, identityRegex, maxCount = 50, field = 'author', includeFiles = false, timeRange = '1 year') {
     const git = (0, simple_git_1.default)(repoRoot);
-    // Build args with strict formatting and ISO dates; no shell expansion.
-    // Limit to last year to prevent scanning entire history on large repos
     const args = [
         'log',
         `--extended-regexp`,
         `-n`, String(maxCount),
-        `--since`, '1 year ago',
         `--${field}`, identityRegex,
         '--date=iso-strict',
         '--pretty=%H%x1f%an%x1f%ae%x1f%ad%x1f%s'
     ];
+    // Map timeRange to git --since argument (skip for 'all')
+    if (timeRange !== 'all') {
+        args.splice(4, 0, '--since', timeRange + ' ago'); // Insert after -n and maxCount
+    }
     if (includeFiles) {
         args.push('--name-only');
     }

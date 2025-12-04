@@ -15,21 +15,24 @@ export async function getCommitsByIdentity(
     identityRegex: string,
     maxCount = 50,
     field: 'author' | 'committer' = 'author',
-    includeFiles = false
+    includeFiles = false,
+    timeRange: string = '1 year'
 ): Promise<RawCommit[]> {
     const git: SimpleGit = simpleGit(repoRoot);
 
-    // Build args with strict formatting and ISO dates; no shell expansion.
-    // Limit to last year to prevent scanning entire history on large repos
     const args = [
         'log',
         `--extended-regexp`,
         `-n`, String(maxCount),
-        `--since`, '1 year ago',
         `--${field}`, identityRegex,
         '--date=iso-strict',
         '--pretty=%H%x1f%an%x1f%ae%x1f%ad%x1f%s'
     ];
+
+    // Map timeRange to git --since argument (skip for 'all')
+    if (timeRange !== 'all') {
+        args.splice(4, 0, '--since', timeRange + ' ago'); // Insert after -n and maxCount
+    }
 
     if (includeFiles) {
         args.push('--name-only');
