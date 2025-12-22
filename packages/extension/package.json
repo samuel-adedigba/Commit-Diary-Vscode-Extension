@@ -1,9 +1,15 @@
 {
   "name": "commitdiary-extension",
-  "displayName": "Commit Diary",
+  "displayName": "Commit Diary (Beta)",
+  "preview": true,
   "description": "Track, categorize, and analyze your Git commits directly in VS Code.",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "publisher": "samuel-adedigba",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/samuel-adedigba/Commit-Diary-Vscode-Extension"
+  },
   "engines": {
     "vscode": "^1.75.0"
   },
@@ -14,15 +20,17 @@
   "scripts": {
     "prebuild": "pnpm -w --filter @commitdiary/core build",
     "build": "tsc -p .",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "tsc -w -p .",
-    "package": "vsce package",
-    "vscode:prepublish": "pnpm run build",
+    "package": "vsce package --no-dependencies",
+    "vscode:prepublish": "npm run bundle",
     "dev": "pnpm run watch"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
     "@types/uuid": "^10.0.0",
     "@types/vscode": "^1.75.0",
+    "esbuild": "^0.27.2",
     "typescript": "^5.6.3",
     "vsce": "^2.15.0"
   },
@@ -283,9 +291,9 @@
   ],
   "files": [
     "dist",
-    "out",
     "wasm",
-    "sql-wasm.wasm",
-    "!**/*.ts"
+    "LICENSE",
+    "README.md",
+    "icon.png"
   ]
 }
