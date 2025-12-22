@@ -28,6 +28,9 @@ nohup.out
 .env.test
 .env*.local
 
+# Ignore all .env files in all subdirectories
+**/.env
+
 # Databases
 *.db
 *.sqlite
