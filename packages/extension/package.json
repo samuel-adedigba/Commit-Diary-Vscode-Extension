@@ -20,14 +20,17 @@
     "dev": "pnpm run watch"
   },
   "devDependencies": {
-    "typescript": "^5.6.3",
     "@types/node": "^20.12.12",
+    "@types/uuid": "^10.0.0",
     "@types/vscode": "^1.75.0",
+    "typescript": "^5.6.3",
     "vsce": "^2.15.0"
   },
   "dependencies": {
+    "@commitdiary/core": "workspace:*",
     "simple-git": "^3.20.0",
-    "@commitdiary/core": "workspace:*"
+    "sql.js": "^1.13.0",
+    "uuid": "^10.0.0"
   },
   "contributes": {
     "commands": [
@@ -46,6 +49,42 @@
       {
         "command": "commitDiary.clearCache",
         "title": "CommitDiary: Clear Cache"
+      },
+      {
+        "command": "commitDiary.showMetrics",
+        "title": "CommitDiary: Show Commit Metrics"
+      },
+      {
+        "command": "commitDiary.login",
+        "title": "CommitDiary: Setup Cloud Sync"
+      },
+      {
+        "command": "commitDiary.logout",
+        "title": "CommitDiary: Remove API Key"
+      },
+      {
+        "command": "commitDiary.syncNow",
+        "title": "CommitDiary: Sync Now"
+      },
+      {
+        "command": "commitDiary.forceFullResync",
+        "title": "CommitDiary: Force Full Resync"
+      },
+      {
+        "command": "commitDiary.exportDB",
+        "title": "CommitDiary: Export Database"
+      },
+      {
+        "command": "commitDiary.checkSyncStatus",
+        "title": "CommitDiary: Check Sync Status"
+      },
+      {
+        "command": "commitDiary.viewSyncedCommits",
+        "title": "CommitDiary: View Synced Commits"
+      },
+      {
+        "command": "commitDiary.resetDatabase",
+        "title": "CommitDiary: Reset Local Database"
       }
     ],
     "menus": {
@@ -65,39 +104,188 @@
         {
           "command": "commitDiary.clearCache",
           "when": "true"
+        },
+        {
+          "command": "commitDiary.showMetrics",
+          "when": "true"
         }
       ]
     },
-      "configuration": {
-        "title": "CommitDiary",
-        "properties": {
-          "commitDiary.user.emails": {
-            "type": "array",
-            "items": {
-              "type": "string"
+    "configuration": {
+      "title": "CommitDiary",
+      "properties": {
+        "commitDiary.user.emails": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Email(s) to identify 'my commits'. If empty, CommitDiary reads git config user.email and discovers emails for your user.name in this repo."
+        },
+        "commitDiary.debounceDelay": {
+          "type": "number",
+          "default": 2000,
+          "markdownDescription": "Debounce delay in milliseconds for status bar updates on Git repository changes."
+        },
+        "commitDiary.defaultTimeRange": {
+          "type": "string",
+          "enum": [
+            "1 week",
+            "1 month",
+            "3 months",
+            "6 months",
+            "1 year",
+            "2 years",
+            "all"
+          ],
+          "default": "1 year",
+          "markdownDescription": "Default time range for fetching commits. Use 'all' to fetch entire history (may be slow on large repositories)."
+        },
+        "commitDiary.sync.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "✅ Cloud sync enabled. Sync starts automatically when you add an API key. Disable this to turn off cloud sync."
+        },
+        "commitDiary.sync.autoInterval": {
+          "type": "string",
+          "enum": [
+            "never",
+            "hourly",
+            "daily"
+          ],
+          "default": "daily",
+          "markdownDescription": "Automatic sync interval. Default is daily for battery efficiency."
+        },
+        "commitDiary.dashboardUrl": {
+          "type": "string",
+          "default": "http://localhost:3000/",
+          "markdownDescription": "CommitDiary dashboard URL for registration and API key management."
+        },
+        "commitDiary.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Your CommitDiary API key for cloud sync. [Get one from the dashboard](https://dashboard.commitdiary.com) - sign in, generate a key, and paste it here!"
+        },
+        "commitDiary.sync.chunkSize": {
+          "type": "number",
+          "default": 200,
+          "minimum": 50,
+          "maximum": 500,
+          "markdownDescription": "Number of commits to sync per request. Lower values reduce timeout risk."
+        },
+        "commitDiary.sync.includeEmails": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Include author emails in synced data. When disabled, only hashed emails are sent for privacy."
+        },
+        "commitDiary.componentRules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "Regex pattern to match file paths"
+              },
+              "name": {
+                "type": "string",
+                "description": "Component name to assign"
+              }
             },
-            "default": [],
-            "markdownDescription": "Email(s) to identify 'my commits'. If empty, CommitDiary reads git config user.email and discovers emails for your user.name in this repo."
+            "required": [
+              "pattern",
+              "name"
+            ]
           },
-          "commitDiary.debounceDelay": {
-            "type": "number",
-            "default": 2000,
-            "markdownDescription": "Debounce delay in milliseconds for status bar updates on Git repository changes."
-          },
-          "commitDiary.defaultTimeRange": {
-            "type": "string",
-            "enum": ["1 week", "1 month", "3 months", "6 months", "1 year", "2 years", "all"],
-            "default": "1 year",
-            "markdownDescription": "Default time range for fetching commits. Use 'all' to fetch entire history (may be slow on large repositories)."
-          }
+          "default": [],
+          "markdownDescription": "Custom rules for detecting components from file paths. Leave empty to use default rules. Example: `{\"pattern\": \"^src/components/\", \"name\": \"Components\"}`"
+        },
+        "commitDiary.telemetry.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Send anonymous usage telemetry to help improve CommitDiary. No PII is collected."
+        },
+        "commitDiary.notifications.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable toast notifications for CommitDiary events."
+        },
+        "commitDiary.notifications.verbosity": {
+          "type": "string",
+          "enum": [
+            "quiet",
+            "normal",
+            "verbose"
+          ],
+          "default": "normal",
+          "markdownDescription": "Notification verbosity level. **Quiet**: Only critical events. **Normal**: Important events with smart batching. **Verbose**: All events immediately."
+        },
+        "commitDiary.notifications.onNewCommits": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show notification when new commits are detected."
+        },
+        "commitDiary.notifications.onBranchSwitch": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show notification when branch is switched."
+        },
+        "commitDiary.notifications.onWorkspaceChange": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show notification when workspace folders change."
+        },
+        "commitDiary.notifications.onSyncStart": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show notification when sync starts (verbose mode only)."
+        },
+        "commitDiary.notifications.onSyncComplete": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show notification when sync completes successfully."
+        },
+        "commitDiary.notifications.onSyncFailed": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show notification when sync fails."
+        },
+        "commitDiary.notifications.onRepoDiscovered": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show notification when a new repository is discovered."
+        },
+        "commitDiary.notifications.onFirstCommit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show welcome notification when tracking first commit in a new repository."
+        },
+        "commitDiary.autoSync.onDetection": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically trigger sync when new commits are detected."
+        },
+        "commitDiary.autoDiff.onBranchSwitch": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically rescan commits when branch is switched."
         }
       }
+    }
   },
   "activationEvents": [
     "onStartupFinished",
     "onCommand:commitDiary.discoverRepos",
     "onCommand:commitDiary.showMyCommits",
     "onCommand:commitDiary.refreshCount",
-    "onCommand:commitDiary.clearCache"
+    "onCommand:commitDiary.clearCache",
+    "onCommand:commitDiary.showMetrics"
+  ],
+  "files": [
+    "dist",
+    "out",
+    "wasm",
+    "sql-wasm.wasm",
+    "!**/*.ts"
   ]
 }

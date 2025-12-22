@@ -2,5 +2,8 @@
   "name": "commitdiary",
   "private": true,
   "version": "1.0.0",
-  "scripts": {}
+  "scripts": {
+    "api": "pnpm --filter api start",
+    "dev": "pnpm --filter api start"
+  }
 }
