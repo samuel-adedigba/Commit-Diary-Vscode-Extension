@@ -11,11 +11,9 @@ const port = process.env.PORT || 3001;
 
 // CORS Configuration - Must be FIRST middleware
 const allowedOrigins = [
-  "http://localhost:3000",
-  "http://localhost:3001",
-  "http://localhost:3002",
+  process.env.DASHBOARD_URL || "http://localhost:3000",
+  process.env.PUBLIC_URL || "http://localhost:3000",
   "https://dashboard.commitdiary.com",
-  process.env.DASHBOARD_URL,
 ].filter(Boolean);
 
 app.use((req, res, next) => {
@@ -813,6 +811,8 @@ app.post("/v1/shares", authMiddleware, async (req, res) => {
 
     const username = user?.username || "user";
     const publicUrl = `${
+      // TODO:   process.env.PUBLIC_URL || "http://localhost:3000"
+      // REPLACE WITH PRODUCTION URL
       process.env.PUBLIC_URL || "http://localhost:3000"
     }/s/${username}/${token}`;
 
@@ -881,7 +881,7 @@ app.get("/v1/shares", authMiddleware, async (req, res) => {
       scope: share.scope,
       token: share.token,
       url: `${
-        process.env.PUBLIC_URL || "http://localhost:3000"
+        process.env.PUBLIC_URL || "https://dashboard.commitdiary.com"
       }/s/${username}/${share.token}`,
       expires_at: share.expires_at,
       revoked: share.revoked,
@@ -1149,7 +1149,7 @@ app.get("/v1/shares/:shareId/export", authMiddleware, async (req, res) => {
 app.listen(port, () => {
   console.log(`🚀 CommitDiary API running on port ${port}`);
   console.log(`📊 Database: Supabase Postgres`);
-  console.log(`🔗 Supabase URL: ${supabaseUrl}`);
+  // console.log(`🔗 Supabase URL: ${supabaseUrl}`);
 });
 
 module.exports = app;

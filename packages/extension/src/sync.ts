@@ -86,8 +86,9 @@ export class SyncManager {
     private loadConfig(): SyncConfig {
         const vscodeConfig = vscode.workspace.getConfiguration('commitDiary')
 
-        // Use hardcoded API URL (setting removed from package.json to hide from UI)
-        const apiUrl = 'http://localhost:3001'
+        //TODO: Use production API URL (setting removed from package.json to hide from UI)
+        // REPLACE WITH PRODUCTION API URL
+        const apiUrl = 'https://commitdiary-backend.onrender.com'
 
         this.output?.appendLine(`[Sync] Using API URL: ${apiUrl}`)
 
@@ -191,7 +192,7 @@ export class SyncManager {
 
             // Get unsynced commits
             const unsyncedCommits = getUnsyncedCommits(repoId, this.config.chunkSize)
-            
+
             if (unsyncedCommits.length === 0) {
                 this.output.appendLine('[Sync] ✅ No unsynced commits')
                 return true
@@ -244,8 +245,8 @@ export class SyncManager {
 
             if (response) {
                 // Use server-confirmed SHAs if available, otherwise use all sent SHAs
-                const confirmedShas = response.synced_shas && response.synced_shas.length > 0 
-                    ? response.synced_shas 
+                const confirmedShas = response.synced_shas && response.synced_shas.length > 0
+                    ? response.synced_shas
                     : shas
 
                 // Mark confirmed commits as synced with server timestamp
@@ -294,14 +295,14 @@ export class SyncManager {
             // Determine if we'll retry and when
             const willRetry = true
             const retryDelay = this.config.retryDelays[0] // First retry delay
-            
+
             // Check if this is a network error (offline)
             const errorMessage = String(error)
-            const isNetworkError = errorMessage.includes('fetch failed') || 
-                                  errorMessage.includes('ECONNREFUSED') ||
-                                  errorMessage.includes('ETIMEDOUT') ||
-                                  errorMessage.includes('network')
-            
+            const isNetworkError = errorMessage.includes('fetch failed') ||
+                errorMessage.includes('ECONNREFUSED') ||
+                errorMessage.includes('ETIMEDOUT') ||
+                errorMessage.includes('network')
+
             if (isNetworkError) {
                 // Notify offline/queued status
                 const statsResult = getSyncStats(repoId)
@@ -423,11 +424,11 @@ export class SyncManager {
 
             try {
                 const payload = JSON.parse(commitsJson) as DeltaPayload
-                
+
                 // Mark as syncing
                 const shas = payload.commits.map(c => c.sha)
                 markCommitsSyncing(shas, batchId, this.context)
-                
+
                 const compressed = await this.compressPayload(payload)
 
                 const response = await this.sendWithRetry(compressed, token)
@@ -459,7 +460,7 @@ export class SyncManager {
             } catch (error) {
                 // Reset syncing commits
                 resetSyncingCommits(batchId, this.context)
-                
+
                 // Update attempt count with exponential backoff
                 updateSyncQueueAttempt(queueId, String(error), this.context)
                 this.output.appendLine(`[Sync] ❌ Queue item ${queueId} failed (attempt ${attemptCount + 1}): ${error}`)
@@ -473,7 +474,7 @@ export class SyncManager {
     async startAutoSync() {
         const config = vscode.workspace.getConfiguration('commitDiary')
         const syncEnabled = config.get<boolean>('sync.enabled', true)
-        
+
         // Only show notification if user explicitly disabled sync
         if (!syncEnabled) {
             this.output.appendLine('[Sync] Auto-sync disabled in settings')
@@ -524,12 +525,12 @@ export class SyncManager {
         this.syncTimer = setInterval(async () => {
             this.output.appendLine('[Sync] Running scheduled sync...')
             await this.processSyncQueue()
-            
+
             // Check for accumulated unsynced commits
             await this.checkSyncHealth()
         }, intervalMs)
     }
-    
+
     /**
      * Check sync health and warn about accumulated unsynced commits
      */
@@ -539,16 +540,16 @@ export class SyncManager {
             // This is a simple check - could be enhanced to track per-repo
             const db = (this.context.globalState as any).db
             if (!db) return
-            
+
             const result = db.exec(`
                 SELECT COUNT(*) as count 
                 FROM commits 
                 WHERE sync_status = 'pending'
             `)
-            
+
             if (result && result[0] && result[0].values && result[0].values[0]) {
                 const unsyncedCount = result[0].values[0][0] as number
-                
+
                 // Notify if threshold exceeded (default 50)
                 await this.notificationManager?.notifyUnsyncedAccumulation(unsyncedCount, 50)
             }

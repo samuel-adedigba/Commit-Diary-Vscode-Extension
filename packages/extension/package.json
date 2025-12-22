@@ -158,7 +158,7 @@
         },
         "commitDiary.dashboardUrl": {
           "type": "string",
-          "default": "http://localhost:3000/",
+          "default": "https://commitdiary-web.vercel.app",
           "markdownDescription": "CommitDiary dashboard URL for registration and API key management."
         },
         "commitDiary.apiKey": {

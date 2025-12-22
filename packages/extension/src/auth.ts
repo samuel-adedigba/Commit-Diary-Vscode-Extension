@@ -35,7 +35,7 @@ export class AuthManager {
         // First check settings (new location)
         const config = vscode.workspace.getConfiguration('commitDiary')
         const settingsApiKey = config.get<string>('apiKey', '').trim()
-        
+
         if (settingsApiKey) {
             return settingsApiKey
         }
@@ -64,7 +64,7 @@ export class AuthManager {
         await this.context.secrets.store('api_key', apiKey)
         await this.context.globalState.update('auth_timestamp', Date.now())
         this.output.appendLine('[Auth] ✅ API key stored successfully')
-        
+
         // Show success notification
         vscode.window.showInformationMessage(
             '✅ CommitDiary: API key saved! Cloud sync is now enabled.',
@@ -82,14 +82,17 @@ export class AuthManager {
     async validateApiKey(apiKey?: string): Promise<boolean> {
         try {
             const key = apiKey || await this.getApiKey()
-            
+
             if (!key) {
                 return false
             }
 
             const config = vscode.workspace.getConfiguration('commitDiary')
-            let apiUrl = config.get<string>('sync.apiUrl', 'http://localhost:3001')
-            
+            // TODO: Use production API URL (setting removed from package.json to hide from UI)
+            // REPLACE WITH PRODUCTION API URL
+            //  let apiUrl = config.get<string>('sync.apiUrl', 'http://localhost:3001')
+            let apiUrl = config.get<string>('sync.apiUrl', 'https://commitdiary-backend.onrender.com')
+
             // Ensure URL doesn't have trailing slash for endpoint construction
             apiUrl = apiUrl.replace(/\/$/, '')
 
@@ -129,11 +132,11 @@ export class AuthManager {
         try {
             // Clear from secrets
             await this.context.secrets.delete('api_key')
-            
+
             // Clear from settings
             const config = vscode.workspace.getConfiguration('commitDiary')
             await config.update('apiKey', '', vscode.ConfigurationTarget.Global)
-            
+
             // Clear auth state
             await this.context.globalState.update('auth_timestamp', undefined)
 
