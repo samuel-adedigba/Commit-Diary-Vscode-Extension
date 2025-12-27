@@ -172,7 +172,7 @@
         "commitDiary.apiKey": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Your CommitDiary API key for cloud sync. [Get one from the dashboard](https://dashboard.commitdiary.com) - sign in, generate a key, and paste it here!"
+          "markdownDescription": "Your CommitDiary API key for cloud sync. [Get one from the dashboard](https://commitdiary-web.vercel.app) - sign in, generate a key, and paste it here!"
         },
         "commitDiary.sync.chunkSize": {
           "type": "number",

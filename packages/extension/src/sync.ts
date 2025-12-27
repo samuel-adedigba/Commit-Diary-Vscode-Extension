@@ -88,12 +88,13 @@ export class SyncManager {
 
         //TODO: Use production API URL (setting removed from package.json to hide from UI)
         // REPLACE WITH PRODUCTION API URL
-        const apiUrl = 'https://commitdiary-backend.onrender.com'
+         const apiUrl = 'https://commitdiary-backend.onrender.com'
+       // const apiUrl = 'http://localhost:3001'
 
-       // this.output?.appendLine(`[Sync] Using API URL: ${apiUrl}`)
-
+        // Always enable auto-sync by default
         return {
-            enabled: vscodeConfig.get<boolean>('sync.enabled', true),
+            // enabled: vscodeConfig.get<boolean>('sync.enabled', true),
+            enabled: true, // Force enabled regardless of user setting
             apiUrl,
             chunkSize: vscodeConfig.get<number>('sync.chunkSize', 200),
             maxRetries: 3,
@@ -399,7 +400,7 @@ export class SyncManager {
         }
 
         this.output.appendLine(`[Sync] Processing ${queue.length} items from sync queue`)
-      //  this.output.appendLine(`[Sync] Using API URL: ${this.config.apiUrl}`)
+        //  this.output.appendLine(`[Sync] Using API URL: ${this.config.apiUrl}`)
 
         const token = await this.getAuthToken()
         if (!token) {

@@ -90,8 +90,8 @@ export class AuthManager {
             const config = vscode.workspace.getConfiguration('commitDiary')
             // TODO: Use production API URL (setting removed from package.json to hide from UI)
             // REPLACE WITH PRODUCTION API URL
-            //  let apiUrl = config.get<string>('sync.apiUrl', 'http://localhost:3001')
-            let apiUrl = config.get<string>('sync.apiUrl', 'https://commitdiary-backend.onrender.com')
+        //    let apiUrl = config.get<string>('sync.apiUrl', 'http://localhost:3001')
+         let apiUrl = config.get<string>('sync.apiUrl', 'https://commitdiary-backend.onrender.com')
 
             // Ensure URL doesn't have trailing slash for endpoint construction
             apiUrl = apiUrl.replace(/\/$/, '')
@@ -153,8 +153,9 @@ export class AuthManager {
      * Prompt user to register if not authenticated
      */
     async promptRegistration(): Promise<void> {
-        const dashboardUrl = vscode.workspace.getConfiguration('commitDiary').get<string>('dashboardUrl', 'https://dashboard.commitdiary.com')
-
+        // TODO : Use production dashboard URL
+        const dashboardUrl = vscode.workspace.getConfiguration('commitDiary').get<string>('dashboardUrl', 'https://commitdiary-web.vercel.app')
+        //const dashboardUrl = vscode.workspace.getConfiguration('commitDiary').get<string>('dashboardUrl', 'http://localhost:3000')
         const action = await vscode.window.showInformationMessage(
             '🚀 CommitDiary: Register for cloud sync to backup and analyze your commits across all devices!',
             { modal: false },
@@ -176,7 +177,9 @@ export class AuthManager {
      * Show instructions for setting up API key
      */
     async showApiKeyInstructions(): Promise<void> {
-        const dashboardUrl = vscode.workspace.getConfiguration('commitDiary').get<string>('dashboardUrl', 'https://dashboard.commitdiary.com')
+        // TODO : Use production dashboard URL
+        const dashboardUrl = vscode.workspace.getConfiguration('commitDiary').get<string>('dashboardUrl', 'https://commitdiary-web.vercel.app')
+        //const dashboardUrl = vscode.workspace.getConfiguration('commitDiary').get<string>('dashboardUrl', 'http://localhost:3000')
 
         const message = `To enable cloud sync:
 1. Register at ${dashboardUrl}
