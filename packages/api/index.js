@@ -13,7 +13,7 @@ const port = process.env.PORT || 3001;
 const allowedOrigins = [
   process.env.DASHBOARD_URL || "http://localhost:3000",
   process.env.PUBLIC_URL || "http://localhost:3000",
-  "https://dashboard.commitdiary.com",
+  "https://commitdiary-web.vercel.app",
 ].filter(Boolean);
 
 app.use((req, res, next) => {
@@ -477,7 +477,7 @@ app.get("/v1/users/:userId/commits", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    const { from, to, limit = 50, offset = 0, category } = req.query;
+    const { from, to, limit = 50, offset = 0, category, search } = req.query;
 
     // Build base query for both count and data
     let baseQuery = supabaseAdmin
@@ -493,8 +493,20 @@ app.get("/v1/users/:userId/commits", authMiddleware, async (req, res) => {
       baseQuery = baseQuery.lte("date", to);
     }
 
+    // console.log(`[API] Fetching commits for user ${userId} with params:`, {
+    //   from,
+    //   to,
+    //   category,
+    //   search,
+    // });
+
     if (category) {
       baseQuery = baseQuery.eq("category", category);
+    }
+
+    if (search) {
+      // Search in commit message
+      baseQuery = baseQuery.ilike("message", `%${search}%`);
     }
 
     // Execute query with pagination
@@ -584,7 +596,7 @@ app.post("/v1/users/api-keys", authMiddleware, async (req, res) => {
       return res.status(500).json({ error: "Failed to generate API key" });
     }
 
-    console.log(`✅ Generated API key for user ${userId}: ${name}`);
+    // console.log(`✅ Generated API key for user ${userId}: ${name}`);
 
     // Return the key ONCE (user must save it)
     res.json({
@@ -616,7 +628,7 @@ app.delete("/v1/users/api-keys/:keyId", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "API key not found" });
     }
 
-    console.log(`✅ Revoked API key ${keyId} for user ${userId}`);
+  //  console.log(`✅ Revoked API key ${keyId} for user ${userId}`);
 
     res.json({ message: "API key revoked" });
   } catch (error) {
@@ -754,7 +766,8 @@ async function buildSnapshot(userId, scope, limit = 500) {
 app.post("/v1/shares", authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
-    const { title, description, repos, from, to, expires_in_days } = req.body;
+    const { title, description, repos, from, to, expires_in_days, live } =
+      req.body;
 
     if (!title) {
       return res.status(400).json({ error: "Title is required" });
@@ -770,7 +783,7 @@ app.post("/v1/shares", authMiddleware, async (req, res) => {
         ).toISOString()
       : null;
 
-    const scope = { repos: repos || [], from, to };
+    const scope = { repos: repos || [], from, to, live: !!live };
 
     // Create share record
     const { data: share, error: shareError } = await supabaseAdmin
@@ -813,10 +826,10 @@ app.post("/v1/shares", authMiddleware, async (req, res) => {
     const publicUrl = `${
       // TODO:   process.env.PUBLIC_URL || "http://localhost:3000"
       // REPLACE WITH PRODUCTION URL
-      process.env.PUBLIC_URL || "http://localhost:3000"
+      process.env.PUBLIC_URL
     }/s/${username}/${token}`;
 
-    console.log(`✅ Created share ${share.id} for user ${userId}`);
+   // console.log(`✅ Created share ${share.id} for user ${userId}`);
 
     res.json({
       id: share.id,
@@ -881,7 +894,7 @@ app.get("/v1/shares", authMiddleware, async (req, res) => {
       scope: share.scope,
       token: share.token,
       url: `${
-        process.env.PUBLIC_URL || "https://dashboard.commitdiary.com"
+        process.env.DASHBOARD_URL || "https://commitdiary-web.vercel.app"
       }/s/${username}/${share.token}`,
       expires_at: share.expires_at,
       revoked: share.revoked,
@@ -914,7 +927,7 @@ app.delete("/v1/shares/:shareId", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Share not found" });
     }
 
-    console.log(`✅ Revoked share ${shareId} for user ${userId}`);
+//    console.log(`✅ Revoked share ${shareId} for user ${userId}`);
 
     res.json({ message: "Share revoked" });
   } catch (error) {
@@ -983,11 +996,52 @@ app.get("/s/:username/:token", async (req, res) => {
     });
 
     // Get snapshot
-    const { data: snapshot, error: snapshotError } = await supabaseAdmin
+    let { data: snapshot, error: snapshotError } = await supabaseAdmin
       .from("share_snapshots")
-      .select("payload, total_commits, total_repos")
+      .select("payload, total_commits, total_repos, updated_at")
       .eq("share_id", shareData.id)
       .single();
+
+    // Check for "Live Mode" refresh
+    if (snapshot && shareData.scope?.live) {
+      const lastUpdate = new Date(snapshot.updated_at).getTime();
+      const now = Date.now();
+      const needsRefresh = now - lastUpdate > 15 * 60 * 1000; // 15 minutes
+
+      if (needsRefresh) {
+        console.log(
+          "🔄 [Live Mode] Refreshing snapshot for share:",
+          shareData.id
+        );
+        try {
+          const newSnapshot = await buildSnapshot(
+            shareData.user_id,
+            shareData.scope
+          );
+
+          // Update DB - effectively treating this as a new cache entry
+          await supabaseAdmin
+            .from("share_snapshots")
+            .update({
+              payload: newSnapshot,
+              total_commits: newSnapshot.total_commits,
+              total_repos: newSnapshot.total_repos,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("share_id", shareData.id);
+
+          // Update local variable
+          snapshot = {
+            payload: newSnapshot,
+            total_commits: newSnapshot.total_commits,
+            total_repos: newSnapshot.total_repos,
+          };
+        } catch (err) {
+          console.error("Failed to refresh live snapshot:", err);
+          // Fall through to serve stale data rather than failing
+        }
+      }
+    }
 
     if (snapshotError || !snapshot) {
       // Fallback: build on the fly
