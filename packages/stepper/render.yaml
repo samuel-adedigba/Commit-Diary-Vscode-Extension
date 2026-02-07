@@ -1,8 +1,8 @@
 services:
   - type: web
-    name: commitdiary-stepper
+    name: stepper
     env: node
-    rootDir: packages/stepper
+    rootDir: .
     plan: free
     region: frankfurt
     buildCommand: pnpm install && pnpm build

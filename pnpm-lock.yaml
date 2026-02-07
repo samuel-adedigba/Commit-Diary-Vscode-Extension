@@ -10,6 +10,9 @@ importers:
 
   packages/api:
     dependencies:
+      '@commitdiary/stepper':
+        specifier: workspace:*
+        version: link:../stepper
       '@supabase/supabase-js':
         specifier: ^2.81.1
         version: 2.81.1
@@ -80,6 +83,9 @@ importers:
       cors:
         specifier: ^2.8.6
         version: 2.8.6
+      dotenv:
+        specifier: ^17.2.3
+        version: 17.2.3
       express:
         specifier: ^4.18.2
         version: 4.22.1
@@ -2835,6 +2841,7 @@ packages:
   next@13.4.12:
     resolution: {integrity: sha512-eHfnru9x6NRmTMcjQp6Nz0J4XH9OubmzOa7CkWL+AUrUxpibub3vWwttjduu9No16dug1kq04hiUUpo7J3m3Xw==}
     engines: {node: '>=16.8.0'}
+    deprecated: This version has a security vulnerability. Please upgrade to a patched version. See https://nextjs.org/blog/security-update-2025-12-11 for more details.
     hasBin: true
     peerDependencies:
       '@opentelemetry/api': ^1.1.0

@@ -98,7 +98,7 @@ export const PROVIDER_SPECS: Record<string, ProviderSpec> = {
     cohere: {
         name: 'cohere',
         baseUrl: 'https://api.cohere.ai',
-        endpoint: '/v1/chat',
+        endpoint: '/v2/chat',
         apiKeyEnvVar: 'COHERE_API_KEY',
         defaultModel: 'command-r-plus',
 

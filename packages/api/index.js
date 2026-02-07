@@ -1,10 +1,59 @@
-const express = require("express");
-const { createClient } = require("@supabase/supabase-js");
-const zlib = require("zlib");
-const crypto = require("crypto");
+import express from "express";
+import { createClient } from "@supabase/supabase-js";
+import zlib from "zlib";
+import crypto from "crypto";
+import dotenv from "dotenv";
 
 // Load environment variables from .env file
-require("dotenv").config();
+dotenv.config();
+
+// Report service imports
+import * as reportService from "./services/reportService.js";
+import { initCronPoller } from "./cron/cronPoller.js";
+
+// Stepper Integration
+let stepper = null;
+const STEPPER_URL = process.env.STEPPER_URL || "http://localhost:3005";
+
+async function initStepper() {
+  try {
+    const stepperModule = await import("@commitdiary/stepper");
+    stepper = stepperModule;
+    console.log("✅ Stepper package loaded via workspace");
+  } catch (e) {
+    console.log(
+      `ℹ️  Stepper package not found, using HTTP mode at ${STEPPER_URL}`,
+    );
+    // HTTP Fallback implementation
+    stepper = {
+      enqueueReport: async (input) => {
+        try {
+          const response = await fetch(`${STEPPER_URL}/v1/reports`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(input),
+          });
+          const data = await response.json();
+          return { status: response.status, ...data };
+        } catch (err) {
+          console.error("[Stepper HTTP] Enqueue failed:", err.message);
+          throw err;
+        }
+      },
+      getJob: async (jobId) => {
+        try {
+          const response = await fetch(`${STEPPER_URL}/v1/reports/${jobId}`);
+          return await response.json();
+        } catch (err) {
+          console.error("[Stepper HTTP] Get job failed:", err.message);
+          throw err;
+        }
+      },
+    };
+  }
+}
+
+initStepper();
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -25,11 +74,11 @@ app.use((req, res, next) => {
 
   res.setHeader(
     "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS"
+    "GET, POST, PUT, DELETE, OPTIONS",
   );
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-API-Key, X-Client-Version, Content-Encoding"
+    "Content-Type, Authorization, X-API-Key, X-Client-Version, Content-Encoding",
   );
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
@@ -76,7 +125,7 @@ const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseServiceKey) {
   console.warn(
-    "⚠️  Supabase credentials not configured. Authentication will fail."
+    "⚠️  Supabase credentials not configured. Authentication will fail.",
   );
 }
 
@@ -92,7 +141,7 @@ const supabaseAdmin =
 
 if (!supabaseAdmin) {
   console.error(
-    "❌ Supabase client not initialized. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
+    "❌ Supabase client not initialized. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
   );
   process.exit(1);
 }
@@ -201,7 +250,7 @@ function checkRateLimit(shareId, ipAddress) {
   if (tokensToAdd > 0) {
     bucket.tokens = Math.min(
       RATE_LIMIT_BUCKET_SIZE,
-      bucket.tokens + tokensToAdd
+      bucket.tokens + tokensToAdd,
     );
     bucket.lastRefill = now;
   }
@@ -224,10 +273,16 @@ app.get("/", (req, res) => {
     endpoints: {
       "/v1/ingest/commits": "POST - Ingest commit data",
       "/v1/repos/:repoId/metrics": "GET - Get repository metrics",
+      "/v1/repos/:repoId/reports/toggle":
+        "PUT - Toggle auto-report generation for repo",
+      "/v1/repos/reports": "GET - List repos with report settings",
       "/v1/users/:userId/commits": "GET - Get user commits",
       "/v1/users/profile": "GET - Get user profile (auth check)",
       "/v1/users/api-keys": "GET - List API keys, POST - Generate API key",
       "/v1/users/api-keys/:keyId": "DELETE - Revoke API key",
+      "/v1/commits/:commitId/report":
+        "GET - Get report, POST - Trigger generation",
+      "/v1/jobs/:jobId": "GET - Get job status",
       "/v1/shares": "GET - List shares, POST - Create share",
       "/v1/shares/:shareId": "DELETE - Revoke share",
       "/v1/shares/:shareId/export": "GET - Export share data",
@@ -294,9 +349,9 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
         {
           onConflict: "user_id,remote",
           ignoreDuplicates: false,
-        }
+        },
       )
-      .select("id")
+      .select("id, enable_reports")
       .single();
 
     if (repoError) {
@@ -305,6 +360,7 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
     }
 
     const repoId = repoData.id;
+    const enableReports = repoData.enable_reports === true;
 
     // Prepare commits for upsert
     const commitsToInsert = commits.map((commit) => ({
@@ -319,6 +375,7 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
       files: commit.files,
       components: commit.components,
       patterns: commit.context_tags || [],
+      diff_summary: commit.diff_summary || null,
     }));
 
     // Upsert commits (Supabase handles deduplication via UNIQUE constraint on user_id, sha)
@@ -328,7 +385,7 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
         onConflict: "user_id,sha",
         ignoreDuplicates: false, // Return all rows even if duplicates
       })
-      .select("sha");
+      .select("id, sha");
 
     if (commitError) {
       console.error("Commit upsert error:", commitError);
@@ -348,12 +405,81 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
     }));
 
     console.log(
-      `✅ [Supabase] Synced ${syncedCount} commits for user ${userId}`
+      `✅ [Supabase] Synced ${syncedCount} commits for user ${userId}`,
     );
     if (rejected.length > 0) {
       console.log(
-        `⚠️  [Supabase] Rejected ${rejected.length} commits (duplicates)`
+        `⚠️  [Supabase] Rejected ${rejected.length} commits (duplicates)`,
       );
+    }
+
+    // Auto-trigger report generation if enabled for this repo
+    let reportJobs = [];
+    if (
+      enableReports &&
+      stepper &&
+      insertedCommits &&
+      insertedCommits.length > 0
+    ) {
+      console.log(
+        `📝 Auto-generating reports for ${insertedCommits.length} commits...`,
+      );
+
+      // Create a map of SHA -> commit data for quick lookup
+      const commitDataMap = new Map();
+      commits.forEach((c) => {
+        commitDataMap.set(c.sha, c);
+      });
+
+      // Trigger report generation for each new commit (in parallel, but limit concurrency)
+      const reportPromises = insertedCommits
+        .slice(0, 10)
+        .map(async (insertedCommit) => {
+          try {
+            const originalCommit = commitDataMap.get(insertedCommit.sha);
+            if (!originalCommit) return null;
+
+            const promptInput = {
+              userId,
+              commitSha: insertedCommit.sha,
+              repo: repo.name,
+              message: originalCommit.message || "",
+              files: (originalCommit.files || []).map((f) => f.path || f),
+              components: originalCommit.components || [],
+              diffSummary: originalCommit.diff_summary || "",
+            };
+
+            const result = await stepper.enqueueReport(promptInput);
+
+            if (result.status === 202) {
+              // Job enqueued - create tracking entry
+              await reportService.createReportJob(supabaseAdmin, {
+                commitId: insertedCommit.id,
+                userId,
+                jobId: result.jobId,
+              });
+              return { sha: insertedCommit.sha, jobId: result.jobId };
+            } else if (result.status === 200) {
+              // Cached - save directly (rare during ingest, but handle it)
+              return { sha: insertedCommit.sha, cached: true };
+            }
+          } catch (err) {
+            console.error(
+              `Error triggering report for ${insertedCommit.sha}:`,
+              err,
+            );
+            return null;
+          }
+        });
+
+      const results = await Promise.allSettled(reportPromises);
+      reportJobs = results
+        .filter((r) => r.status === "fulfilled" && r.value)
+        .map((r) => r.value);
+
+      if (reportJobs.length > 0) {
+        console.log(`📋 Created ${reportJobs.length} report jobs`);
+      }
     }
 
     res.json({
@@ -363,6 +489,8 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
       last_synced_sha:
         syncedCount > 0 ? syncedShas[syncedShas.length - 1] : null,
       server_timestamp: new Date().toISOString(),
+      reports_enabled: enableReports,
+      report_jobs: reportJobs.length > 0 ? reportJobs : undefined,
     });
   } catch (error) {
     console.error("Ingest error:", error);
@@ -398,17 +526,17 @@ app.get("/v1/repos/:repoId/metrics", authMiddleware, async (req, res) => {
       switch (period) {
         case "week":
           startDate = new Date(
-            now.getTime() - 7 * 24 * 60 * 60 * 1000
+            now.getTime() - 7 * 24 * 60 * 60 * 1000,
           ).toISOString();
           break;
         case "month":
           startDate = new Date(
-            now.getTime() - 30 * 24 * 60 * 60 * 1000
+            now.getTime() - 30 * 24 * 60 * 60 * 1000,
           ).toISOString();
           break;
         case "year":
           startDate = new Date(
-            now.getTime() - 365 * 24 * 60 * 60 * 1000
+            now.getTime() - 365 * 24 * 60 * 60 * 1000,
           ).toISOString();
           break;
         default:
@@ -628,7 +756,7 @@ app.delete("/v1/users/api-keys/:keyId", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "API key not found" });
     }
 
-  //  console.log(`✅ Revoked API key ${keyId} for user ${userId}`);
+    //  console.log(`✅ Revoked API key ${keyId} for user ${userId}`);
 
     res.json({ message: "API key revoked" });
   } catch (error) {
@@ -662,6 +790,275 @@ app.post("/v1/telemetry", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("Telemetry error:", error);
     res.status(500).json({ error: "Failed to record telemetry" });
+  }
+});
+
+// ==================== COMMIT REPORTS ENDPOINTS ====================
+
+// Toggle auto-report generation for a repository
+app.put(
+  "/v1/repos/:repoId/reports/toggle",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { repoId } = req.params;
+      const { enabled } = req.body;
+      const userId = req.userId;
+
+      if (typeof enabled !== "boolean") {
+        return res.status(400).json({ error: "enabled must be a boolean" });
+      }
+
+      const result = await reportService.toggleReports(
+        supabaseAdmin,
+        parseInt(repoId),
+        userId,
+        enabled,
+      );
+
+      if (!result.success) {
+        return res.status(400).json({ error: result.error });
+      }
+
+      console.log(
+        `📝 Reports ${enabled ? "enabled" : "disabled"} for repo ${repoId}`,
+      );
+      res.json({
+        message: `Reports ${enabled ? "enabled" : "disabled"}`,
+        enabled,
+      });
+    } catch (error) {
+      console.error("Toggle reports error:", error);
+      res.status(500).json({ error: "Failed to toggle reports" });
+    }
+  },
+);
+
+// Get report for a specific commit
+app.get("/v1/commits/:commitId/report", authMiddleware, async (req, res) => {
+  try {
+    const { commitId } = req.params;
+    const userId = req.userId;
+
+    // First check if report exists
+    const report = await reportService.getReport(
+      supabaseAdmin,
+      parseInt(commitId),
+      userId,
+    );
+
+    if (report) {
+      return res.json({
+        status: "completed",
+        report,
+      });
+    }
+
+    // Check if there's a pending job
+    const job = await reportService.getJobStatus(
+      supabaseAdmin,
+      parseInt(commitId),
+      userId,
+    );
+
+    if (job) {
+      return res.json({
+        status: job.status,
+        jobId: job.job_id,
+        attempts: job.attempts,
+        createdAt: job.created_at,
+      });
+    }
+
+    // No report and no job
+    res.json({ status: "not_found" });
+  } catch (error) {
+    console.error("Get report error:", error);
+    res.status(500).json({ error: "Failed to fetch report" });
+  }
+});
+
+// Trigger report generation for a commit
+app.post("/v1/commits/:commitId/report", authMiddleware, async (req, res) => {
+  try {
+    const { commitId } = req.params;
+    const userId = req.userId;
+
+    console.log(
+      `[DEBUG] Trigger report for commit ${commitId} by user ${userId}`,
+    );
+
+    // Check if report already exists
+    const existingReport = await reportService.getReport(
+      supabaseAdmin,
+      parseInt(commitId),
+      userId,
+    );
+
+    if (existingReport) {
+      return res.json({
+        status: "completed",
+        message: "Report already exists",
+        report: existingReport,
+      });
+    }
+
+    // Check if there's already a pending job
+    const existingJob = await reportService.getJobStatus(
+      supabaseAdmin,
+      parseInt(commitId),
+      userId,
+    );
+
+    if (existingJob && existingJob.status === "pending") {
+      return res.status(202).json({
+        status: "processing",
+        message: "Report generation already in progress",
+        jobId: existingJob.job_id,
+      });
+    }
+
+    // Get commit data for report generation
+    const commit = await reportService.getCommitForReport(
+      supabaseAdmin,
+      parseInt(commitId),
+      userId,
+    );
+
+    if (!commit) {
+      return res.status(404).json({ error: "Commit not found" });
+    }
+
+    // Check if stepper is available
+    if (!stepper) {
+      return res.status(503).json({
+        error: "Report generation service not available",
+      });
+    }
+
+    // Trigger report generation via Stepper
+    const promptInput = {
+      userId,
+      commitSha: commit.sha,
+      repo: commit.repos?.name || "unknown",
+      message: commit.message || "",
+      files: (commit.files || []).map((f) => f.path || f),
+      components: commit.components || [],
+      diffSummary: commit.diff_summary || "",
+    };
+
+    const result = await stepper.enqueueReport(promptInput);
+
+    if (result.status === 200) {
+      // Immediate cache hit - save directly
+      await reportService.completeJob(
+        supabaseAdmin,
+        `direct_${Date.now()}`,
+        result.data,
+        { provider: "cached" },
+      );
+
+      return res.json({
+        status: "completed",
+        message: "Report generated from cache",
+        report: result.data,
+      });
+    }
+
+    // Job enqueued - create tracking entry
+    const jobResult = await reportService.createReportJob(supabaseAdmin, {
+      commitId: parseInt(commitId),
+      userId,
+      jobId: result.jobId,
+    });
+
+    if (!jobResult.success) {
+      return res.status(500).json({ error: jobResult.error });
+    }
+
+    console.log(
+      `📋 Report job created: ${result.jobId} for commit ${commitId}`,
+    );
+
+    res.status(202).json({
+      status: "processing",
+      message: "Report generation started",
+      jobId: result.jobId,
+    });
+  } catch (error) {
+    console.error("Trigger report error:", error);
+    res.status(500).json({ error: "Failed to trigger report generation" });
+  }
+});
+
+// Get job status by ID
+app.get("/v1/jobs/:jobId", authMiddleware, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    // Get job from database
+    const { data: job, error } = await supabaseAdmin
+      .from("report_jobs")
+      .select("*")
+      .eq("job_id", jobId)
+      .single();
+
+    if (error || !job) {
+      // Job might be completed - check if report exists
+      return res.json({
+        status: "not_found",
+        message:
+          "Job not found. It may have completed - check the commit report.",
+      });
+    }
+
+    // Optionally check stepper for real-time status
+    let stepperStatus = null;
+    if (stepper) {
+      try {
+        stepperStatus = await stepper.getJob(jobId);
+      } catch (e) {
+        // Stepper unavailable, use DB status
+      }
+    }
+
+    res.json({
+      status: job.status,
+      jobId: job.job_id,
+      commitId: job.commit_id,
+      attempts: job.attempts,
+      createdAt: job.created_at,
+      lastPolledAt: job.last_polled_at,
+      nextPollAt: job.next_poll_at,
+      errorMessage: job.error_message,
+      stepperState: stepperStatus?.state || null,
+    });
+  } catch (error) {
+    console.error("Get job status error:", error);
+    res.status(500).json({ error: "Failed to fetch job status" });
+  }
+});
+
+// Get all repos with their report settings
+app.get("/v1/repos/reports", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    const { data: repos, error } = await supabaseAdmin
+      .from("repos")
+      .select("id, name, remote, enable_reports, updated_at")
+      .eq("user_id", userId)
+      .order("name");
+
+    if (error) {
+      console.error("Get repos error:", error);
+      return res.status(500).json({ error: "Failed to fetch repos" });
+    }
+
+    res.json({ repos: repos || [] });
+  } catch (error) {
+    console.error("Get repos reports error:", error);
+    res.status(500).json({ error: "Failed to fetch repos" });
   }
 });
 
@@ -746,7 +1143,7 @@ async function buildSnapshot(userId, scope, limit = 500) {
           commit_count: commits.length,
           commits: commits,
         };
-      }
+      },
     );
 
     return {
@@ -779,7 +1176,7 @@ app.post("/v1/shares", authMiddleware, async (req, res) => {
     // Calculate expiry
     const expiresAt = expires_in_days
       ? new Date(
-          Date.now() + expires_in_days * 24 * 60 * 60 * 1000
+          Date.now() + expires_in_days * 24 * 60 * 60 * 1000,
         ).toISOString()
       : null;
 
@@ -829,7 +1226,7 @@ app.post("/v1/shares", authMiddleware, async (req, res) => {
       process.env.PUBLIC_URL
     }/s/${username}/${token}`;
 
-   // console.log(`✅ Created share ${share.id} for user ${userId}`);
+    // console.log(`✅ Created share ${share.id} for user ${userId}`);
 
     res.json({
       id: share.id,
@@ -867,7 +1264,7 @@ app.get("/v1/shares", authMiddleware, async (req, res) => {
           total_commits,
           total_repos
         )
-      `
+      `,
       )
       .eq("user_id", userId)
       .order("created_at", { ascending: false });
@@ -927,7 +1324,7 @@ app.delete("/v1/shares/:shareId", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Share not found" });
     }
 
-//    console.log(`✅ Revoked share ${shareId} for user ${userId}`);
+    //    console.log(`✅ Revoked share ${shareId} for user ${userId}`);
 
     res.json({ message: "Share revoked" });
   } catch (error) {
@@ -957,7 +1354,7 @@ app.get("/s/:username/:token", async (req, res) => {
         expires_at,
         revoked,
         users!inner (username)
-      `
+      `,
       )
       .eq("token", token)
       .eq("users.username", username)
@@ -1011,12 +1408,12 @@ app.get("/s/:username/:token", async (req, res) => {
       if (needsRefresh) {
         console.log(
           "🔄 [Live Mode] Refreshing snapshot for share:",
-          shareData.id
+          shareData.id,
         );
         try {
           const newSnapshot = await buildSnapshot(
             shareData.user_id,
-            shareData.scope
+            shareData.scope,
           );
 
           // Update DB - effectively treating this as a new cache entry
@@ -1073,7 +1470,7 @@ app.get("/s/:username/:token", async (req, res) => {
       const allCommits = repoData.commits || [];
       const paginatedCommits = allCommits.slice(
         offset,
-        offset + parseInt(limit)
+        offset + parseInt(limit),
       );
 
       return {
@@ -1166,7 +1563,7 @@ app.get("/v1/shares/:shareId/export", authMiddleware, async (req, res) => {
       res.setHeader("Content-Type", "text/markdown");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="${share.title.replace(/[^a-z0-9]/gi, "_")}.md"`
+        `attachment; filename="${share.title.replace(/[^a-z0-9]/gi, "_")}.md"`,
       );
       res.send(markdown);
     } else if (format === "csv") {
@@ -1186,7 +1583,7 @@ app.get("/v1/shares/:shareId/export", authMiddleware, async (req, res) => {
       res.setHeader("Content-Type", "text/csv");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="${share.title.replace(/[^a-z0-9]/gi, "_")}.csv"`
+        `attachment; filename="${share.title.replace(/[^a-z0-9]/gi, "_")}.csv"`,
       );
       res.send(csv);
     } else {
@@ -1204,6 +1601,15 @@ app.listen(port, () => {
   console.log(`🚀 CommitDiary API running on port ${port}`);
   console.log(`📊 Database: Supabase Postgres`);
   // console.log(`🔗 Supabase URL: ${supabaseUrl}`);
+
+  // Initialize cron poller for async report jobs
+  if (supabaseAdmin) {
+    initCronPoller({
+      supabase: supabaseAdmin,
+      stepper: stepper,
+      intervalMs: 2 * 60 * 1000, // 2 minutes
+    });
+  }
 });
 
-module.exports = app;
+export default app;

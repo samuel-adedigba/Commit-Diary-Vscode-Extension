@@ -1,4 +1,8 @@
 import { StepperConfig, ProviderConfig } from './types.js';
+import dotenv from 'dotenv';
+
+// Load environment variables as early as possible
+dotenv.config();
 
 /**
  * Load configuration from environment variables with sensible defaults.
@@ -87,7 +91,7 @@ export function loadConfig(): StepperConfig {
       name: 'cohere',
       enabled: process.env.COHERE_ENABLED === 'true',
       baseUrl: process.env.COHERE_BASE_URL || 'https://api.cohere.ai/v1',
-      modelName: process.env.COHERE_MODEL || 'command',
+      modelName: process.env.COHERE_MODEL || 'command-a-03-2025',
       apiKeyEnvVar: 'COHERE_API_KEY',
       rateLimitRPM: parseInt(process.env.COHERE_RPM || '5', 10),
       concurrency: parseInt(process.env.COHERE_CONCURRENCY || '2', 10),
@@ -174,7 +178,7 @@ export function loadConfig(): StepperConfig {
       },
     },
     server: {
-      port: parseInt(process.env.PORT || '3001', 10),
+      port: parseInt(process.env.PORT || '3005', 10),
       metricsPort: process.env.METRICS_PORT ? parseInt(process.env.METRICS_PORT, 10) : undefined,
     },
   };

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS commits (
     files JSONB,
     components JSONB,
     patterns JSONB,
+    diff_summary TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     synced_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(user_id, sha)
@@ -149,6 +150,106 @@ $$ language 'plpgsql';
 
 -- Trigger to update updated_at on repos
 CREATE TRIGGER update_repos_updated_at BEFORE UPDATE ON repos
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ==================== COMMIT REPORTS SYSTEM ====================
+
+-- Add enable_reports column to repos table
+ALTER TABLE repos ADD COLUMN IF NOT EXISTS enable_reports BOOLEAN DEFAULT false;
+
+-- Commit Reports table (stores AI-generated reports)
+CREATE TABLE IF NOT EXISTS commit_reports (
+    id SERIAL PRIMARY KEY,
+    commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    
+    -- Report content (matches Stepper ReportOutput)
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    changes JSONB DEFAULT '[]'::jsonb,
+    rationale TEXT,
+    impact_and_tests TEXT,
+    next_steps JSONB DEFAULT '[]'::jsonb,
+    tags TEXT,
+    
+    -- Metadata
+    provider_used TEXT,                    -- Which AI provider generated this
+    generation_time_ms INTEGER,            -- How long it took
+    template_used TEXT DEFAULT 'default',  -- Template version used
+    
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    UNIQUE(commit_id)  -- One report per commit
+);
+
+CREATE INDEX IF NOT EXISTS idx_commit_reports_commit_id ON commit_reports(commit_id);
+CREATE INDEX IF NOT EXISTS idx_commit_reports_user_id ON commit_reports(user_id);
+
+-- Report Jobs table (tracks pending AI job requests)
+CREATE TABLE IF NOT EXISTS report_jobs (
+    id SERIAL PRIMARY KEY,
+    commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    
+    -- Job tracking
+    job_id TEXT NOT NULL UNIQUE,           -- Stepper/BullMQ job ID
+    status TEXT NOT NULL DEFAULT 'pending', -- pending, processing, completed, failed
+    
+    -- Polling metadata
+    attempts INTEGER DEFAULT 0,            -- How many times we've polled
+    last_polled_at TIMESTAMPTZ,
+    next_poll_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Error tracking
+    error_message TEXT,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    UNIQUE(commit_id)  -- One active job per commit
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_jobs_status ON report_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_report_jobs_job_id ON report_jobs(job_id);
+CREATE INDEX IF NOT EXISTS idx_report_jobs_next_poll ON report_jobs(next_poll_at) WHERE status = 'pending';
+
+-- Enable RLS on new tables
+ALTER TABLE commit_reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE report_jobs ENABLE ROW LEVEL SECURITY;
+
+-- Commit Reports policies
+CREATE POLICY "Users can read own reports" ON commit_reports
+    FOR SELECT USING (user_id = auth.uid()::text);
+
+CREATE POLICY "Users can insert own reports" ON commit_reports
+    FOR INSERT WITH CHECK (user_id = auth.uid()::text);
+
+CREATE POLICY "Users can update own reports" ON commit_reports
+    FOR UPDATE USING (user_id = auth.uid()::text);
+
+CREATE POLICY "Users can delete own reports" ON commit_reports
+    FOR DELETE USING (user_id = auth.uid()::text);
+
+-- Report Jobs policies
+CREATE POLICY "Users can read own jobs" ON report_jobs
+    FOR SELECT USING (user_id = auth.uid()::text);
+
+CREATE POLICY "Users can insert own jobs" ON report_jobs
+    FOR INSERT WITH CHECK (user_id = auth.uid()::text);
+
+CREATE POLICY "Users can update own jobs" ON report_jobs
+    FOR UPDATE USING (user_id = auth.uid()::text);
+
+CREATE POLICY "Users can delete own jobs" ON report_jobs
+    FOR DELETE USING (user_id = auth.uid()::text);
+
+-- Trigger to update updated_at on commit_reports
+CREATE TRIGGER update_commit_reports_updated_at BEFORE UPDATE ON commit_reports
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger to update updated_at on report_jobs
+CREATE TRIGGER update_report_jobs_updated_at BEFORE UPDATE ON report_jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Grant necessary permissions (run as service_role if needed)
