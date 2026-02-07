@@ -1,3 +1,6 @@
 [submodule "packages/web-dashboard"]
 	path = packages/web-dashboard
 	url = https://github.com/samuel-adedigba/commitdiary-web.git
+[submodule "packages/stepper"]
+	path = packages/stepper
+	url = https://github.com/samuel-adedigba/ai-inference-stepper.git
