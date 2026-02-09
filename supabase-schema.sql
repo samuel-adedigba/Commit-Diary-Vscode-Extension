@@ -84,58 +84,75 @@ ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE telemetry ENABLE ROW LEVEL SECURITY;
 
 -- Users can only read/write their own data
+DROP POLICY IF EXISTS "Users can read own data" ON users;
 CREATE POLICY "Users can read own data" ON users
     FOR SELECT USING (auth.uid()::text = id);
 
+DROP POLICY IF EXISTS "Users can insert own data" ON users;
 CREATE POLICY "Users can insert own data" ON users
     FOR INSERT WITH CHECK (auth.uid()::text = id);
 
+DROP POLICY IF EXISTS "Users can update own data" ON users;
 CREATE POLICY "Users can update own data" ON users
     FOR UPDATE USING (auth.uid()::text = id);
 
 -- Repos policies
+DROP POLICY IF EXISTS "Users can read own repos" ON repos;
 CREATE POLICY "Users can read own repos" ON repos
     FOR SELECT USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can insert own repos" ON repos;
 CREATE POLICY "Users can insert own repos" ON repos
     FOR INSERT WITH CHECK (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can update own repos" ON repos;
 CREATE POLICY "Users can update own repos" ON repos
     FOR UPDATE USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can delete own repos" ON repos;
 CREATE POLICY "Users can delete own repos" ON repos
     FOR DELETE USING (user_id = auth.uid()::text);
 
 -- Commits policies
+DROP POLICY IF EXISTS "Users can read own commits" ON commits;
 CREATE POLICY "Users can read own commits" ON commits
     FOR SELECT USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can insert own commits" ON commits;
 CREATE POLICY "Users can insert own commits" ON commits
     FOR INSERT WITH CHECK (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can update own commits" ON commits;
 CREATE POLICY "Users can update own commits" ON commits
     FOR UPDATE USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can delete own commits" ON commits;
 CREATE POLICY "Users can delete own commits" ON commits
     FOR DELETE USING (user_id = auth.uid()::text);
 
 -- API Keys policies
+DROP POLICY IF EXISTS "Users can read own api_keys" ON api_keys;
 CREATE POLICY "Users can read own api_keys" ON api_keys
     FOR SELECT USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can insert own api_keys" ON api_keys;
 CREATE POLICY "Users can insert own api_keys" ON api_keys
     FOR INSERT WITH CHECK (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can update own api_keys" ON api_keys;
 CREATE POLICY "Users can update own api_keys" ON api_keys
     FOR UPDATE USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can delete own api_keys" ON api_keys;
 CREATE POLICY "Users can delete own api_keys" ON api_keys
     FOR DELETE USING (user_id = auth.uid()::text);
 
 -- Telemetry policies
+DROP POLICY IF EXISTS "Users can read own telemetry" ON telemetry;
 CREATE POLICY "Users can read own telemetry" ON telemetry
     FOR SELECT USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can insert own telemetry" ON telemetry;
 CREATE POLICY "Users can insert own telemetry" ON telemetry
     FOR INSERT WITH CHECK (user_id = auth.uid()::text);
 
@@ -149,6 +166,7 @@ END;
 $$ language 'plpgsql';
 
 -- Trigger to update updated_at on repos
+DROP TRIGGER IF EXISTS update_repos_updated_at ON repos;
 CREATE TRIGGER update_repos_updated_at BEFORE UPDATE ON repos
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
@@ -176,6 +194,7 @@ CREATE TABLE IF NOT EXISTS commit_reports (
     provider_used TEXT,                    -- Which AI provider generated this
     generation_time_ms INTEGER,            -- How long it took
     template_used TEXT DEFAULT 'default',  -- Template version used
+    generation_type TEXT DEFAULT 'manual', -- 'auto', 'manual', or 'backfill'
     
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -219,36 +238,46 @@ ALTER TABLE commit_reports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE report_jobs ENABLE ROW LEVEL SECURITY;
 
 -- Commit Reports policies
+DROP POLICY IF EXISTS "Users can read own reports" ON commit_reports;
 CREATE POLICY "Users can read own reports" ON commit_reports
     FOR SELECT USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can insert own reports" ON commit_reports;
 CREATE POLICY "Users can insert own reports" ON commit_reports
     FOR INSERT WITH CHECK (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can update own reports" ON commit_reports;
 CREATE POLICY "Users can update own reports" ON commit_reports
     FOR UPDATE USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can delete own reports" ON commit_reports;
 CREATE POLICY "Users can delete own reports" ON commit_reports
     FOR DELETE USING (user_id = auth.uid()::text);
 
 -- Report Jobs policies
+DROP POLICY IF EXISTS "Users can read own jobs" ON report_jobs;
 CREATE POLICY "Users can read own jobs" ON report_jobs
     FOR SELECT USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can insert own jobs" ON report_jobs;
 CREATE POLICY "Users can insert own jobs" ON report_jobs
     FOR INSERT WITH CHECK (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can update own jobs" ON report_jobs;
 CREATE POLICY "Users can update own jobs" ON report_jobs
     FOR UPDATE USING (user_id = auth.uid()::text);
 
+DROP POLICY IF EXISTS "Users can delete own jobs" ON report_jobs;
 CREATE POLICY "Users can delete own jobs" ON report_jobs
     FOR DELETE USING (user_id = auth.uid()::text);
 
 -- Trigger to update updated_at on commit_reports
+DROP TRIGGER IF EXISTS update_commit_reports_updated_at ON commit_reports;
 CREATE TRIGGER update_commit_reports_updated_at BEFORE UPDATE ON commit_reports
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Trigger to update updated_at on report_jobs
+DROP TRIGGER IF EXISTS update_report_jobs_updated_at ON report_jobs;
 CREATE TRIGGER update_report_jobs_updated_at BEFORE UPDATE ON report_jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
@@ -257,3 +286,90 @@ CREATE TRIGGER update_report_jobs_updated_at BEFORE UPDATE ON report_jobs
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+
+-- ==================== USER WEBHOOK SETTINGS ====================
+-- Added in migration: 20251207_user_webhook_settings.sql
+
+-- User webhook settings for Discord notifications
+CREATE TABLE IF NOT EXISTS user_webhook_settings (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    discord_webhook_url TEXT NOT NULL,
+    webhook_secret TEXT NOT NULL,
+    enabled BOOLEAN DEFAULT true,
+    events JSONB DEFAULT '[
+        "report_completed",
+        "report_failed",
+        "backfill_started",
+        "backfill_completed",
+        "backfill_failed",
+        "sync_completed",
+        "repo_enabled"
+    ]'::jsonb,
+    last_delivery_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_failure_at TIMESTAMPTZ,
+    failure_count INTEGER DEFAULT 0,
+    total_deliveries INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_webhook_settings_user_id ON user_webhook_settings(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_webhook_settings_enabled ON user_webhook_settings(enabled) WHERE enabled = true;
+
+-- Webhook delivery logs
+CREATE TABLE IF NOT EXISTS user_webhook_delivery_log (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    webhook_settings_id INTEGER NOT NULL REFERENCES user_webhook_settings(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    status_code INTEGER,
+    success BOOLEAN DEFAULT false,
+    error_message TEXT,
+    attempt INTEGER DEFAULT 1,
+    response_body TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_webhook_delivery_log_user_id ON user_webhook_delivery_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_webhook_delivery_log_webhook_settings_id ON user_webhook_delivery_log(webhook_settings_id);
+CREATE INDEX IF NOT EXISTS idx_user_webhook_delivery_log_created_at ON user_webhook_delivery_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_webhook_delivery_log_event_type ON user_webhook_delivery_log(event_type);
+
+-- Enable RLS on webhook tables
+ALTER TABLE user_webhook_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_webhook_delivery_log ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies for user_webhook_settings
+DROP POLICY IF EXISTS "Users can read own webhook settings" ON user_webhook_settings;
+CREATE POLICY "Users can read own webhook settings" ON user_webhook_settings
+    FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "Users can insert own webhook settings" ON user_webhook_settings;
+CREATE POLICY "Users can insert own webhook settings" ON user_webhook_settings
+    FOR INSERT WITH CHECK (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "Users can update own webhook settings" ON user_webhook_settings;
+CREATE POLICY "Users can update own webhook settings" ON user_webhook_settings
+    FOR UPDATE USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "Users can delete own webhook settings" ON user_webhook_settings;
+CREATE POLICY "Users can delete own webhook settings" ON user_webhook_settings
+    FOR DELETE USING (user_id = auth.uid()::text);
+
+-- RLS Policies for user_webhook_delivery_log
+DROP POLICY IF EXISTS "Users can read own webhook logs" ON user_webhook_delivery_log;
+CREATE POLICY "Users can read own webhook logs" ON user_webhook_delivery_log
+    FOR SELECT USING (user_id = auth.uid()::text);
+
+DROP POLICY IF EXISTS "Users can insert own webhook logs" ON user_webhook_delivery_log;
+CREATE POLICY "Users can insert own webhook logs" ON user_webhook_delivery_log
+    FOR INSERT WITH CHECK (user_id = auth.uid()::text);
+
+-- Trigger to update updated_at on user_webhook_settings
+DROP TRIGGER IF EXISTS update_user_webhook_settings_updated_at ON user_webhook_settings;
+CREATE TRIGGER update_user_webhook_settings_updated_at BEFORE UPDATE ON user_webhook_settings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

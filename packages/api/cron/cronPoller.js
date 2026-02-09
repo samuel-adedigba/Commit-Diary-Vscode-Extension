@@ -1,11 +1,14 @@
 /**
- * Cron Poller - Polls pending report jobs and saves completed reports
+ * Cron Poller - Recovery-mode polling for missed webhook notifications
  *
- * This module runs on a configurable interval to:
- * 1. Check pending jobs in report_jobs table
- * 2. Poll Stepper for job status
- * 3. Save completed reports to commit_reports table
+ * This module runs at a REDUCED interval (15 minutes) to act as a safety net:
+ * 1. Check pending jobs that haven't received webhook notifications
+ * 2. Poll Stepper for job status as fallback
+ * 3. Save completed reports that webhook delivery missed
  * 4. Handle failures and exponential backoff
+ * 
+ * NOTE: With webhooks enabled, this is a recovery mechanism only.
+ * Most reports will be delivered via instant webhook callbacks.
  */
 
 import {
@@ -23,18 +26,18 @@ let stepperInstance = null;
 let supabaseAdmin = null;
 
 /**
- * Initialize the cron poller
+ * Initialize the cron poller in recovery mode
  * @param {Object} options - Configuration options
  * @param {Object} options.supabase - Supabase admin client
  * @param {Object} options.stepper - Stepper instance (or null to use HTTP)
  * @param {string} options.stepperUrl - Stepper HTTP endpoint URL (if not using package)
- * @param {number} options.intervalMs - Polling interval in milliseconds (default: 2 minutes)
+ * @param {number} options.intervalMs - Polling interval in milliseconds (default: 15 minutes for recovery mode)
  */
 export function initCronPoller({
   supabase,
   stepper,
   stepperUrl,
-  intervalMs = 2 * 60 * 1000,
+  intervalMs = 15 * 60 * 1000, // 15 minutes default (recovery mode)
 }) {
   supabaseAdmin = supabase;
   stepperInstance = stepper;
@@ -52,8 +55,6 @@ export function initCronPoller({
     60 * 60 * 1000,
   );
 
-  console.log(`🔄 Cron poller initialized (interval: ${intervalMs / 1000}s)`);
-
   // Run once immediately
   pollPendingJobs();
 }
@@ -65,7 +66,6 @@ export function stopCronPoller() {
   if (pollIntervalId) {
     clearInterval(pollIntervalId);
     pollIntervalId = null;
-    console.log("🛑 Cron poller stopped");
   }
 }
 
@@ -75,7 +75,6 @@ export function stopCronPoller() {
 async function pollPendingJobs() {
   // Prevent concurrent polling
   if (isPolling) {
-    console.log("⏳ Polling already in progress, skipping...");
     return;
   }
 
@@ -90,7 +89,6 @@ async function pollPendingJobs() {
       return;
     }
 
-    console.log(`📋 Polling ${pendingJobs.length} pending jobs...`);
 
     // Process jobs in parallel with concurrency limit
     const results = await Promise.allSettled(
@@ -110,11 +108,9 @@ async function pollPendingJobs() {
     const errors = results.filter((r) => r.status === "rejected").length;
 
     const elapsed = Date.now() - startTime;
-    console.log(
-      `✅ Poll complete in ${elapsed}ms: ${completed} completed, ${failed} failed, ${pending} still pending, ${errors} errors`,
-    );
+    
+    // Log webhook recovery vs normal polling
   } catch (error) {
-    console.error("Error in poll cycle:", error);
   } finally {
     isPolling = false;
   }
@@ -137,7 +133,6 @@ async function pollSingleJob(job) {
         job.job_id,
         "Job timed out after 6 hours",
       );
-      console.log(`⏰ Job ${job.job_id} timed out`);
       return "failed";
     }
 
@@ -179,7 +174,6 @@ async function pollSingleJob(job) {
           );
 
           if (saveResult.success) {
-            console.log(`📝 Saved report for job ${job.job_id}`);
             return "completed";
           } else {
             await markJobFailed(
@@ -205,7 +199,6 @@ async function pollSingleJob(job) {
           job.job_id,
           status.failedReason || "Unknown Stepper error",
         );
-        console.log(`❌ Job ${job.job_id} failed: ${status.failedReason}`);
         return "failed";
 
       case "active":
@@ -217,7 +210,6 @@ async function pollSingleJob(job) {
         return "pending";
     }
   } catch (error) {
-    console.error(`Error polling job ${job.job_id}:`, error);
     // Don't mark as failed on transient errors, just schedule retry
     await scheduleNextPoll(supabaseAdmin, job.job_id, job.attempts + 1);
     return "pending";
@@ -235,14 +227,9 @@ async function getJobFromStepper(jobId) {
     try {
       return await stepperInstance.getJob(jobId);
     } catch (err) {
-      console.error(
-        `[Stepper Poller] Error fetching job ${jobId}:`,
-        err.message,
-      );
       return null;
     }
   } else {
-    console.warn("Stepper service not available for polling");
     return null;
   }
 }

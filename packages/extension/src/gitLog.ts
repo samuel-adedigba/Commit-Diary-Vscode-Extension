@@ -62,7 +62,6 @@ export async function getCommitsByIdentity(
         return commits;
     } catch (error) {
         // If git command fails (e.g. invalid date or git issue), return empty array
-        console.error('Error executing git log for identity:', error);
         return [];
     }
 }

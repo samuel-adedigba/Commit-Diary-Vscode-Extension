@@ -52,3 +52,27 @@ next-env.d.ts
 
 # Project Specific
 packages/api/api.log
+
+# One-off scripts (internal/dev only)
+scripts/force-backfill-retry.js
+scripts/diagnose-backfill.js
+scripts/cleanup-stale-jobs.js
+scripts/manually-trigger-webhook.js
+scripts/test-backfill-update.js
+scripts/test-webhook-flow.js
+scripts/reset-backfill.js
+scripts/migrate-simple.js
+scripts/migrate-simple.sh
+scripts/migrate-now.sh
+scripts/db-push.sh
+run-shares-migration.sh
+scripts/setup-migrations.sh
+setup-migrations.sh
+scripts/cleanup-old-migrations.js
+scripts/cleanup-old-migrations.sh
+scripts/cleanup-old-migrations.sql
+
+# Root one-off docs
+RUN_THIS_FIRST.md
+QUICK_START.md
+SHARES_MIGRATION_GUIDE

@@ -62,8 +62,6 @@ export class ComponentDetector {
             regex: new RegExp(rule.pattern),
             name: rule.name
         }))
-
-        console.log(`ComponentDetector: Loaded ${this.compiledRules.length} rules`)
     }
 
     private getUserConfigRules(): ComponentRule[] | null {
@@ -72,11 +70,9 @@ export class ComponentDetector {
             const userRules = vscodeConfig.get<ComponentRule[]>('componentRules')
             
             if (userRules && Array.isArray(userRules) && userRules.length > 0) {
-                console.log(`ComponentDetector: Using ${userRules.length} user-defined rules`)
                 return userRules
             }
         } catch (e) {
-            console.error('Error loading user component rules:', e)
         }
         
         return null

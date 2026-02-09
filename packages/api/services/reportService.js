@@ -8,6 +8,30 @@
  * - Repo-level report toggle
  */
 
+import * as discordAlerts from "../alerts/discord.js";
+
+/**
+ * Handle network/timeout errors with graceful degradation
+ * @param {Error} error - The error object
+ * @param {string} operation - Operation name for logging
+ * @returns {Object} - { isNetworkError: boolean, message?: string }
+ */
+function handleNetworkError(error, operation) {
+  if (
+    error?.message?.includes("fetch failed") ||
+    error?.message?.includes("timeout") ||
+    error?.message?.includes("ETIMEDOUT") ||
+    error?.code === "UND_ERR_CONNECT_TIMEOUT" ||
+    error?.cause?.code === "UND_ERR_CONNECT_TIMEOUT"
+  ) {
+    return {
+      isNetworkError: true,
+      message: "Database temporarily unavailable",
+    };
+  }
+  return { isNetworkError: false };
+}
+
 /**
  * Check if reports are enabled for a repository
  * @param {Object} supabaseAdmin - Supabase admin client
@@ -15,18 +39,29 @@
  * @returns {Promise<boolean>}
  */
 export async function isReportsEnabled(supabaseAdmin, repoId) {
-  const { data, error } = await supabaseAdmin
-    .from("repos")
-    .select("enable_reports")
-    .eq("id", repoId)
-    .single();
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("repos")
+      .select("enable_reports")
+      .eq("id", repoId)
+      .single();
 
-  if (error) {
-    console.error("Error checking reports enabled:", error);
-    return false;
+    if (error) {
+      const networkError = handleNetworkError(error, "isReportsEnabled");
+      if (networkError.isNetworkError) {
+        return false; // Default to disabled on network error
+      }
+      return false;
+    }
+
+    return data?.enable_reports === true;
+  } catch (error) {
+    const networkError = handleNetworkError(error, "isReportsEnabled");
+    if (networkError.isNetworkError) {
+      return false;
+    }
+    throw error;
   }
-
-  return data?.enable_reports === true;
 }
 
 /**
@@ -38,27 +73,38 @@ export async function isReportsEnabled(supabaseAdmin, repoId) {
  * @returns {Promise<{success: boolean, error?: string}>}
  */
 export async function toggleReports(supabaseAdmin, repoId, userId, enabled) {
-  const { data, error } = await supabaseAdmin
-    .from("repos")
-    .update({ enable_reports: enabled })
-    .eq("id", repoId)
-    .eq("user_id", userId)
-    .select()
-    .single();
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("repos")
+      .update({ enable_reports: enabled })
+      .eq("id", repoId)
+      .eq("user_id", userId)
+      .select()
+      .single();
 
-  if (error) {
-    console.error("Error toggling reports:", error);
-    return { success: false, error: error.message };
+    if (error) {
+      const networkError = handleNetworkError(error, "toggleReports");
+      if (networkError.isNetworkError) {
+        return { success: false, error: networkError.message };
+      }
+      return { success: false, error: error.message };
+    }
+
+    if (!data) {
+      return {
+        success: false,
+        error: "Repository not found or not owned by user",
+      };
+    }
+
+    return { success: true };
+  } catch (error) {
+    const networkError = handleNetworkError(error, "toggleReports");
+    if (networkError.isNetworkError) {
+      return { success: false, error: networkError.message };
+    }
+    throw error;
   }
-
-  if (!data) {
-    return {
-      success: false,
-      error: "Repository not found or not owned by user",
-    };
-  }
-
-  return { success: true };
 }
 
 /**
@@ -71,6 +117,10 @@ export async function createReportJob(
   supabaseAdmin,
   { commitId, userId, jobId },
 ) {
+  if (!jobId) {
+    return { success: false, error: "jobId is required" };
+  }
+
   // Check if there's already an active job for this commit
   const { data: existingJob } = await supabaseAdmin
     .from("report_jobs")
@@ -102,7 +152,6 @@ export async function createReportJob(
     if (error.code === "23505") {
       return { success: true, jobId, existing: true };
     }
-    console.error("Error creating report job:", error);
     return { success: false, error: error.message };
   }
 
@@ -116,30 +165,41 @@ export async function createReportJob(
  * @returns {Promise<Array>}
  */
 export async function getPendingJobs(supabaseAdmin, limit = 50) {
-  const { data, error } = await supabaseAdmin
-    .from("report_jobs")
-    .select(
-      `
-      id,
-      commit_id,
-      user_id,
-      job_id,
-      status,
-      attempts,
-      created_at
-    `,
-    )
-    .eq("status", "pending")
-    .lte("next_poll_at", new Date().toISOString())
-    .order("created_at", { ascending: true })
-    .limit(limit);
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("report_jobs")
+      .select(
+        `
+        id,
+        commit_id,
+        user_id,
+        job_id,
+        status,
+        attempts,
+        created_at
+      `,
+      )
+      .eq("status", "pending")
+      .lte("next_poll_at", new Date().toISOString())
+      .order("created_at", { ascending: true })
+      .limit(limit);
 
-  if (error) {
-    console.error("Error fetching pending jobs:", error);
+    if (error) {
+      const networkError = handleNetworkError(error, "getPendingJobs");
+      if (networkError.isNetworkError) {
+        return [];
+      }
+      return [];
+    }
+
+    return data || [];
+  } catch (error) {
+    const networkError = handleNetworkError(error, "getPendingJobs");
+    if (networkError.isNetworkError) {
+      return [];
+    }
     return [];
   }
-
-  return data || [];
 }
 
 /**
@@ -161,7 +221,6 @@ export async function scheduleNextPoll(supabaseAdmin, jobId, attempts) {
     .eq("job_id", jobId);
 
   if (error) {
-    console.error("Error scheduling next poll:", error);
   }
 }
 
@@ -185,6 +244,13 @@ function calculateNextPollTime(attempts) {
  * @param {string} errorMessage - Error message
  */
 export async function markJobFailed(supabaseAdmin, jobId, errorMessage) {
+  // Get the job info first
+  const { data: job } = await supabaseAdmin
+    .from("report_jobs")
+    .select("commit_id, user_id")
+    .eq("job_id", jobId)
+    .single();
+
   const { error } = await supabaseAdmin
     .from("report_jobs")
     .update({
@@ -195,7 +261,52 @@ export async function markJobFailed(supabaseAdmin, jobId, errorMessage) {
     .eq("job_id", jobId);
 
   if (error) {
-    console.error("Error marking job failed:", error);
+  }
+
+  // Send Discord webhook notification if user has it configured
+  if (job) {
+    try {
+      // Get user's webhook settings
+      const { data: webhookSettings } = await supabaseAdmin
+        .from("user_webhook_settings")
+        .select("*")
+        .eq("user_id", job.user_id)
+        .eq("enabled", true)
+        .single();
+
+      if (webhookSettings) {
+        // Check if user has subscribed to report_failed events
+        const events = webhookSettings.events || [];
+        if (events.includes("report_failed")) {
+          // Get commit details
+          const { data: commit } = await supabaseAdmin
+            .from("commits")
+            .select("*")
+            .eq("id", job.commit_id)
+            .single();
+
+          if (commit) {
+            // Send webhook event
+            discordAlerts.sendUserWebhookEvent({
+              userId: job.user_id,
+              webhookUrl: webhookSettings.discord_webhook_url,
+              webhookSecret: webhookSettings.webhook_secret,
+              eventType: "report_failed",
+              data: {
+                message: "Report generation failed",
+                commit: commit,
+                error: errorMessage,
+                jobId: jobId,
+              },
+              supabase: supabaseAdmin,
+            });
+
+          }
+        }
+      }
+    } catch (webhookError) {
+      // Don't fail if webhook fails
+    }
   }
 }
 
@@ -206,6 +317,46 @@ export async function markJobFailed(supabaseAdmin, jobId, errorMessage) {
  * @param {Object} reportData - The generated report data
  * @param {Object} metadata - Additional metadata (provider, timing, etc.)
  */
+/**
+ * Save a cached report directly (without a job)
+ * Used when Stepper returns an immediate cache hit
+ */
+export async function saveCachedReport(
+  supabaseAdmin,
+  commitId,
+  userId,
+  reportData,
+  metadata = {},
+) {
+  const { error: reportError } = await supabaseAdmin
+    .from("commit_reports")
+    .upsert(
+      {
+        commit_id: commitId,
+        user_id: userId,
+        title: reportData.title,
+        summary: reportData.summary,
+        changes: reportData.changes || [],
+        rationale: reportData.rationale,
+        impact_and_tests: reportData.impact_and_tests,
+        next_steps: reportData.next_steps || [],
+        tags: reportData.tags,
+        provider_used: metadata.provider || "cached",
+        generation_time_ms: metadata.generationTimeMs || null,
+        template_used: metadata.template || "default",
+        generation_type: metadata.generationType || "manual",
+      },
+      {
+        onConflict: "commit_id",
+      },
+    );
+
+  if (reportError) {
+    return { success: false, error: reportError.message };
+  }
+  return { success: true };
+}
+
 export async function completeJob(
   supabaseAdmin,
   jobId,
@@ -220,13 +371,12 @@ export async function completeJob(
     .single();
 
   if (jobError || !job) {
-    console.error("Error finding job to complete:", jobError);
     return { success: false, error: "Job not found" };
   }
 
   // Start transaction-like operation
   // 1. Insert the report
-  const { error: reportError } = await supabaseAdmin
+  const { data: savedReport, error: reportError } = await supabaseAdmin
     .from("commit_reports")
     .upsert(
       {
@@ -242,14 +392,16 @@ export async function completeJob(
         provider_used: metadata.provider || "unknown",
         generation_time_ms: metadata.generationTimeMs || null,
         template_used: metadata.template || "default",
+        generation_type: metadata.generationType || "manual",
       },
       {
         onConflict: "commit_id",
       },
-    );
+    )
+    .select()
+    .single();
 
   if (reportError) {
-    console.error("Error saving report:", reportError);
     return { success: false, error: reportError.message };
   }
 
@@ -260,11 +412,51 @@ export async function completeJob(
     .eq("job_id", jobId);
 
   if (deleteError) {
-    console.error("Error deleting completed job:", deleteError);
     // Job is complete but not cleaned up - not critical
   }
 
-  console.log(`✅ Report saved for job ${jobId}, commit ${job.commit_id}`);
+  // 3. Send Discord webhook notification if user has it configured
+  try {
+    // Get user's webhook settings
+    const { data: webhookSettings } = await supabaseAdmin
+      .from("user_webhook_settings")
+      .select("*")
+      .eq("user_id", job.user_id)
+      .eq("enabled", true)
+      .single();
+
+    if (webhookSettings) {
+      // Check if user has subscribed to report_completed events
+      const events = webhookSettings.events || [];
+      if (events.includes("report_completed")) {
+        // Get commit details for the Discord embed
+        const { data: commit } = await supabaseAdmin
+          .from("commits")
+          .select("*")
+          .eq("id", job.commit_id)
+          .single();
+
+        if (commit && savedReport) {
+          // Send webhook event
+          discordAlerts.sendUserWebhookEvent({
+            userId: job.user_id,
+            webhookUrl: webhookSettings.discord_webhook_url,
+            webhookSecret: webhookSettings.webhook_secret,
+            eventType: "report_completed",
+            data: {
+              report: savedReport,
+              commit: commit,
+            },
+            supabase: supabaseAdmin,
+          });
+
+        }
+      }
+    }
+  } catch (webhookError) {
+    // Don't fail the job if webhook fails
+  }
+
   return { success: true };
 }
 
@@ -276,22 +468,32 @@ export async function completeJob(
  * @returns {Promise<Object|null>}
  */
 export async function getReport(supabaseAdmin, commitId, userId) {
-  const { data, error } = await supabaseAdmin
-    .from("commit_reports")
-    .select("*")
-    .eq("commit_id", commitId)
-    .eq("user_id", userId)
-    .single();
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("commit_reports")
+      .select("*")
+      .eq("commit_id", commitId)
+      .eq("user_id", userId)
+      .single();
 
-  if (error) {
-    if (error.code !== "PGRST116") {
-      // Not found is ok
-      console.error("Error fetching report:", error);
+    if (error) {
+      if (error.code !== "PGRST116") {
+        // Not found is ok
+        const networkError = handleNetworkError(error, "getReport");
+        if (!networkError.isNetworkError) {
+        }
+      }
+      return null;
     }
-    return null;
-  }
 
-  return data;
+    return data;
+  } catch (error) {
+    const networkError = handleNetworkError(error, "getReport");
+    if (networkError.isNetworkError) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -302,21 +504,31 @@ export async function getReport(supabaseAdmin, commitId, userId) {
  * @returns {Promise<Object|null>}
  */
 export async function getJobStatus(supabaseAdmin, commitId, userId) {
-  const { data, error } = await supabaseAdmin
-    .from("report_jobs")
-    .select("*")
-    .eq("commit_id", commitId)
-    .eq("user_id", userId)
-    .single();
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("report_jobs")
+      .select("*")
+      .eq("commit_id", commitId)
+      .eq("user_id", userId)
+      .single();
 
-  if (error) {
-    if (error.code !== "PGRST116") {
-      console.error("Error fetching job status:", error);
+    if (error) {
+      if (error.code !== "PGRST116") {
+        const networkError = handleNetworkError(error, "getJobStatus");
+        if (!networkError.isNetworkError) {
+        }
+      }
+      return null;
     }
-    return null;
-  }
 
-  return data;
+    return data;
+  } catch (error) {
+    const networkError = handleNetworkError(error, "getJobStatus");
+    if (networkError.isNetworkError) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -341,12 +553,10 @@ export async function cleanupStaleJobs(supabaseAdmin, maxAgeHours = 6) {
     .select("job_id");
 
   if (error) {
-    console.error("Error cleaning up stale jobs:", error);
     return;
   }
 
   if (data && data.length > 0) {
-    console.log(`🧹 Cleaned up ${data.length} stale jobs`);
   }
 }
 
@@ -358,7 +568,6 @@ export async function cleanupStaleJobs(supabaseAdmin, maxAgeHours = 6) {
  * @returns {Promise<Object|null>}
  */
 export async function getCommitForReport(supabaseAdmin, commitId, userId) {
-  console.log(`[SERVICE DEBUG] Fetching commit ${commitId} for user ${userId}`);
   const { data, error } = await supabaseAdmin
     .from("commits")
     .select(
@@ -378,12 +587,344 @@ export async function getCommitForReport(supabaseAdmin, commitId, userId) {
     .single();
 
   if (error) {
-    console.error(
-      `[SERVICE ERROR] Commit fetch failed for ${commitId}:`,
-      error,
-    );
     return null;
   }
 
   return data;
+}
+
+// ==================== BACKFILL FUNCTIONS ====================
+
+/** System-wide constant: max commits to auto-generate on enable */
+export const AUTO_REPORT_LIMIT = 5;
+
+/**
+ * Get the N most recent commits for a repo that don't have reports yet
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} repoId - Repository ID
+ * @param {string} userId - User ID
+ * @param {number} limit - Max commits to return
+ * @returns {Promise<Array>}
+ */
+export async function getRecentCommitsWithoutReports(
+  supabaseAdmin,
+  repoId,
+  userId,
+  limit = AUTO_REPORT_LIMIT,
+) {
+  try {
+    // Get commits for this repo, sorted by date desc, that don't have reports
+    const { data: commits, error } = await supabaseAdmin
+      .from("commits")
+      .select(
+        `
+        id,
+        sha,
+        message,
+        author_name,
+        files,
+        components,
+        diff_summary,
+        date,
+        repo_id,
+        repos(name, remote)
+      `,
+      )
+      .eq("repo_id", repoId)
+      .eq("user_id", userId)
+      .order("date", { ascending: false })
+      .limit(limit * 3); // Fetch more to filter out those with reports
+
+    if (error) {
+      return [];
+    }
+
+    if (!commits || commits.length === 0) return [];
+
+    // Check which of these commits already have reports
+    const commitIds = commits.map((c) => c.id);
+    const { data: existingReports, error: reportsError } = await supabaseAdmin
+      .from("commit_reports")
+      .select("commit_id")
+      .in("commit_id", commitIds);
+
+    if (reportsError) {
+      return [];
+    }
+
+    const reportedCommitIds = new Set(
+      (existingReports || []).map((r) => r.commit_id),
+    );
+
+    // Also check for pending jobs
+    const { data: pendingJobs, error: jobsError } = await supabaseAdmin
+      .from("report_jobs")
+      .select("commit_id")
+      .in("commit_id", commitIds)
+      .eq("status", "pending");
+
+    const pendingCommitIds = new Set(
+      (pendingJobs || []).map((j) => j.commit_id),
+    );
+
+    // Filter to only commits without reports and without pending jobs
+    const unreportedCommits = commits.filter(
+      (c) => !reportedCommitIds.has(c.id) && !pendingCommitIds.has(c.id),
+    );
+
+    return unreportedCommits.slice(0, limit);
+  } catch (error) {
+    return [];
+  }
+}
+
+/**
+ * Create a backfill job to track the backfill operation for a repo
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} repoId - Repository ID
+ * @param {string} userId - User ID
+ * @param {Array} commits - Commits to backfill
+ * @returns {Promise<{success: boolean, backfillId?: number, error?: string}>}
+ */
+export async function createBackfillJob(
+  supabaseAdmin,
+  repoId,
+  userId,
+  commits,
+) {
+  try {
+    const commitDetails = commits.map((c) => ({
+      commitId: c.id,
+      sha: c.sha,
+      status: "pending",
+      jobId: null,
+      error: null,
+    }));
+
+    // Delete any existing backfill job for this repo (allows retry)
+    await supabaseAdmin
+      .from("backfill_jobs")
+      .delete()
+      .eq("repo_id", repoId)
+      .eq("user_id", userId);
+
+    const { data, error } = await supabaseAdmin
+      .from("backfill_jobs")
+      .insert({
+        repo_id: repoId,
+        user_id: userId,
+        status: "processing",
+        total_commits: commits.length,
+        completed_commits: 0,
+        failed_commits: 0,
+        commit_details: commitDetails,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    return { success: true, backfillId: data.id };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Update a single commit's status within a backfill job
+ * Also updates overall backfill status when all commits are done
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} backfillId - Backfill job ID
+ * @param {number} commitId - Commit ID
+ * @param {string} status - New status: 'processing', 'completed', 'failed'
+ * @param {string} jobId - Stepper job ID (if enqueued)
+ * @param {string} errorMsg - Error message (if failed)
+ */
+export async function updateBackfillCommitStatus(
+  supabaseAdmin,
+  backfillId,
+  commitId,
+  status,
+  jobId = null,
+  errorMsg = null,
+) {
+  try {
+    // Get current backfill job
+    const { data: backfill, error: fetchError } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("*")
+      .eq("id", backfillId)
+      .single();
+
+    if (fetchError || !backfill) {
+      return;
+    }
+
+    // Update the specific commit in commit_details
+    const details = backfill.commit_details.map((d) => {
+      if (d.commitId === commitId) {
+        return { ...d, status, jobId: jobId || d.jobId, error: errorMsg };
+      }
+      return d;
+    });
+
+    // Calculate completed/failed counts
+    const completedCount = details.filter(
+      (d) => d.status === "completed",
+    ).length;
+    const failedCount = details.filter((d) => d.status === "failed").length;
+    const totalDone = completedCount + failedCount;
+
+    // Determine overall status
+    let overallStatus = "processing";
+    if (totalDone === backfill.total_commits) {
+      if (failedCount === 0) {
+        overallStatus = "completed";
+      } else if (completedCount === 0) {
+        overallStatus = "failed";
+      } else {
+        overallStatus = "partial";
+      }
+    }
+    
+    const { error: updateError } = await supabaseAdmin
+      .from("backfill_jobs")
+      .update({
+        commit_details: details,
+        completed_commits: completedCount,
+        failed_commits: failedCount,
+        status: overallStatus,
+        error_message:
+          failedCount > 0
+            ? `${failedCount} of ${backfill.total_commits} reports failed`
+            : null,
+      })
+      .eq("id", backfillId);
+
+    if (updateError) {
+    }
+
+    // If all completed successfully, enable reports for the repo
+    if (overallStatus === "completed") {
+      const { error: enableError } = await supabaseAdmin
+        .from("repos")
+        .update({ enable_reports: true })
+        .eq("id", backfill.repo_id)
+        .eq("user_id", backfill.user_id);
+      
+      if (enableError) {
+      }
+    }
+  } catch (error) {
+  }
+}
+
+/**
+ * Get backfill status for a repository
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} repoId - Repository ID
+ * @param {string} userId - User ID
+ * @returns {Promise<Object|null>}
+ */
+export async function getBackfillStatus(supabaseAdmin, repoId, userId) {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("*")
+      .eq("repo_id", repoId)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error) {
+      if (error.code === "PGRST116") return null; // Not found
+      return null;
+    }
+
+    return data;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * Get failed commits from a backfill job for retry
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} repoId - Repository ID
+ * @param {string} userId - User ID
+ * @returns {Promise<Array>} - List of failed commit details
+ */
+export async function getFailedBackfillCommits(supabaseAdmin, repoId, userId) {
+  const backfill = await getBackfillStatus(supabaseAdmin, repoId, userId);
+  if (!backfill) return [];
+
+  return (backfill.commit_details || []).filter((d) => d.status === "failed");
+}
+
+/**
+ * Update backfill job to mark it as retrying (reset failed commits to pending)
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} repoId - Repository ID
+ * @param {string} userId - User ID
+ * @returns {Promise<{success: boolean, backfill?: Object, error?: string}>}
+ */
+export async function resetBackfillForRetry(supabaseAdmin, repoId, userId) {
+  try {
+    const backfill = await getBackfillStatus(supabaseAdmin, repoId, userId);
+    if (!backfill) {
+      return { success: false, error: "No backfill job found" };
+    }
+
+    if (backfill.status !== "failed" && backfill.status !== "partial") {
+      return {
+        success: false,
+        error: `Cannot retry backfill in '${backfill.status}' state`,
+      };
+    }
+
+    // Reset failed commits to pending
+    const details = backfill.commit_details.map((d) => {
+      if (d.status === "failed") {
+        return { ...d, status: "pending", jobId: null, error: null };
+      }
+      return d;
+    });
+
+    const failedCount = details.filter((d) => d.status === "pending").length;
+
+    const { data, error } = await supabaseAdmin
+      .from("backfill_jobs")
+      .update({
+        commit_details: details,
+        failed_commits: 0,
+        status: "processing",
+        error_message: null,
+      })
+      .eq("id", backfill.id)
+      .select()
+      .single();
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    return { success: true, backfill: data };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Check if a repo has an active backfill (processing) and should skip enabling
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} repoId - Repository ID
+ * @param {string} userId - User ID
+ * @returns {Promise<boolean>}
+ */
+export async function hasActiveBackfill(supabaseAdmin, repoId, userId) {
+  const backfill = await getBackfillStatus(supabaseAdmin, repoId, userId);
+  return backfill && backfill.status === "processing";
 }

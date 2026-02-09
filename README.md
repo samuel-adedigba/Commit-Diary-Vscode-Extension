@@ -8,8 +8,71 @@ CommitDiary is a monorepo workspace using pnpm that provides commit tracking and
 
 - **Core Library** (`packages/core`): Shared business logic for commit parsing, categorization, and metrics
 - **VS Code Extension** (`packages/extension`): Desktop tool for real-time commit analysis in the editor
-- **Web Dashboard** (`packages/web-dashboard`): Browser-based interface for commit visualization
-- **API Server** (`packages/api`): Backend service for data processing and external integrations
+- **Web Dashboard** (`packages/web-dashboard`): Browser-based interface for commit visualization and Discord webhook management
+- **API Server** (`packages/api`): Backend service for data processing, AI-powered report generation, and Discord notifications
+- **Stepper** (`packages/stepper`): AI service for generating detailed commit reports using multiple AI providers
+
+## Start Here
+
+Each core package is fully documented to run standalone first, and then as part of this monorepo. Use the links below to jump into setup, flow, and contribution details.
+
+- Core Library: [packages/core/README.md](packages/core/README.md)
+- API Server: [packages/api/README.md](packages/api/README.md)
+- Web Dashboard: [packages/web-dashboard/README.md](packages/web-dashboard/README.md)
+- VS Code Extension: [packages/extension/README.md](packages/extension/README.md)
+- Stepper (AI Orchestrator): [packages/stepper/README.md](packages/stepper/README.md)
+
+## System Flow (Mermaid)
+
+```mermaid
+flowchart LR
+  A[Git repos] --> B[VS Code Extension]
+  B --> C[API Server]
+  C --> D[Stepper AI Service]
+  D --> C
+  C --> E[Web Dashboard]
+  C --> F[Discord Webhooks]
+  B --> G[Core Library]
+  C --> G
+  E --> C
+```
+
+## Package Map
+
+| Package | Purpose | Standalone Setup | Connects To |
+| --- | --- | --- | --- |
+| Core | Parsing, categorization, metrics | [packages/core/README.md](packages/core/README.md) | Extension, API, Dashboard |
+| Extension | Local commit tracking + sync | [packages/extension/README.md](packages/extension/README.md) | Core, API, Dashboard |
+| API | Ingest, auth, reports, webhooks | [packages/api/README.md](packages/api/README.md) | Extension, Dashboard, Stepper |
+| Web Dashboard | UI for analytics + settings | [packages/web-dashboard/README.md](packages/web-dashboard/README.md) | API |
+| Stepper | AI report generation | [packages/stepper/README.md](packages/stepper/README.md) | API |
+
+## Key Features
+
+### 🤖 AI-Powered Commit Reports
+- Automatic generation of detailed commit reports with AI analysis
+- Support for multiple AI providers (OpenAI, Anthropic, Groq, etc.)
+- Intelligent caching and fallback mechanisms
+- Backfill support for generating reports for past commits
+
+### 🔔 Discord Webhook Notifications
+- **User Webhooks**: Configure your own Discord server to receive commit report notifications
+- **Event Subscriptions**: Choose which events to receive (report completed, backfill status, sync events)
+- **Rich Embeds**: Beautiful Discord messages with commit details, AI analysis, and metadata
+- **Delivery Tracking**: View webhook delivery logs and statistics
+- **System Monitoring**: Centralized error alerts for API and dashboard issues
+
+### 📊 Commit Analytics
+- Categorization using conventional commit patterns
+- Time-based grouping (daily, weekly, monthly, yearly)
+- Repository metrics and insights
+- Public sharing with secure token-based links
+
+### 🔐 Secure Authentication
+- Supabase Auth integration
+- API key support for programmatic access
+- Row-level security (RLS) for all data access
+- HMAC-SHA256 webhook signature verification
 
 ## How It Works Together
 

@@ -3,6 +3,9 @@
 
 > Track, categorize, and explain your Git work with clarity—auto-sync, badge, and actionable insights for developers and teams.
 
+- Back to root: [../../README.md](../../README.md)
+- Related packages: [../api/README.md](../api/README.md) • [../web-dashboard/README.md](../web-dashboard/README.md) • [../core/README.md](../core/README.md) • [../stepper/README.md](../stepper/README.md)
+
 ---
 
 <!-- ![Commit Diary Badge](https://commitdiary-web.vercel.app/api/badge?user=YOUR_USERNAME) -->
@@ -20,6 +23,20 @@ _Replace `YOUR_USERNAME` with your actual Commit Diary username._
 - **Privacy Focused**: Only commit metadata (hash, timestamp, message) is processed—your code stays local.
 - **Offline Support**: Commits are queued and synced automatically when you’re back online.
 - **Productivity Metrics**: View commit stats, trends, and breakdowns in VS Code and on the dashboard.
+
+---
+
+## 🔁 Package Flow
+
+```mermaid
+flowchart LR
+	A[Git repo] --> B[Extension]
+	B --> C[Core: parse + categorize]
+	B --> D[Local DB]
+	B --> E[API Server]
+	E --> F[Web Dashboard]
+	E --> G[Stepper AI]
+```
 
 ---
 
@@ -121,6 +138,45 @@ It helps developers tell the story behind their code — simply, honestly, and e
 
 ---
 
+## 🧩 Standalone Local Development
+
+### Prerequisites
+
+- Node.js 18+
+- pnpm
+- A local API running at http://localhost:3001
+
+### Install & Build
+
+```bash
+cd packages/extension
+pnpm install
+pnpm build
+```
+
+### Run in VS Code (Dev)
+
+1. Open the repo in VS Code
+2. Launch the extension via the VS Code Run and Debug panel
+3. Use the command palette to run CommitDiary commands
+
+### ✅ Why This Setup Works
+
+- Extension runs locally and uses the API key to authenticate sync
+- Core library provides consistent categorization across clients
+- API centralizes storage, metrics, and AI report generation
+
+---
+
+## 🔗 How It Connects to CommitDiary
+
+- Uses Core for categorization and metrics: [../core/README.md](../core/README.md)
+- Syncs to API for storage and reports: [../api/README.md](../api/README.md)
+- Dashboard surfaces analytics and API keys: [../web-dashboard/README.md](../web-dashboard/README.md)
+- Stepper generates AI reports via API: [../stepper/README.md](../stepper/README.md)
+
+---
+
 ---
 
 ## 🔄 How Sync Works
@@ -179,6 +235,16 @@ It helps developers tell the story behind their code — simply, honestly, and e
 - **Need More Help?**
 	- Visit the [Commit Diary Dashboard](https://commitdiary-web.vercel.app) for docs and support.
 	- Open an issue on [GitHub](https://github.com/samuel-adedigba/Commit-Diary-Vscode-Extension).
+
+	---
+
+	## 🤝 Contributing
+
+	1. Run the API and dashboard locally
+	2. Set your API key in VS Code settings
+	3. Validate sync, categorization, and dashboard visibility
+
+	Start from [../../README.md](../../README.md) for full monorepo instructions.
 
 ---
 

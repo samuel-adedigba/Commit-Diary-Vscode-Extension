@@ -64,6 +64,14 @@ npx supabase db push
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 PORT=3001
+API_BASE_URL=http://localhost:3001
+
+# Stepper Integration (AI Reports)
+STEPPER_URL=http://localhost:3005
+STEPPER_FORCE_HTTP=false
+
+# Discord Error Monitoring (Optional)
+DISCORD_ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/your-webhook-url
 ```
 
 **Dashboard** (`packages/web-dashboard/.env.local`):
@@ -73,7 +81,49 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
 NEXT_PUBLIC_API_URL=http://localhost:3001
 ```
 
-## Step 5: Run API Server (Optional)
+## Step 5: Configure Discord Webhooks (Optional)
+
+### For User Notifications
+Users can configure their own Discord webhooks through the dashboard to receive commit report notifications:
+
+1. **Create Discord Webhook**:
+   - Open your Discord server
+   - Go to **Server Settings** → **Integrations** → **Webhooks**
+   - Click **New Webhook**
+   - Name it (e.g., "CommitDiary Reports")
+   - Select the channel for notifications
+   - Click **Copy Webhook URL**
+
+2. **Configure in Dashboard**:
+   - Navigate to **Settings** → **Discord Notifications**
+   - Paste your webhook URL
+   - Select which events you want to receive:
+     - `report_completed` - When AI report generation finishes
+     - `report_failed` - When report generation fails
+     - `backfill_started` - When backfill begins
+     - `backfill_completed` - When backfill finishes
+     - `sync_completed` - When commit sync completes
+   - Click **Save Settings**
+   - Click **Send Test** to verify
+
+3. **Webhook Format**:
+   - Reports are sent as rich Discord embeds
+   - Include commit details, AI analysis, and metadata
+   - HMAC-SHA256 signed for security
+
+### For System Error Monitoring
+Administrators can configure a centralized Discord webhook for API/dashboard errors:
+
+1. Create a dedicated Discord channel for error monitoring
+2. Create a webhook for that channel
+3. Add to API `.env`:
+   ```env
+   DISCORD_ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/your-error-webhook
+   ```
+4. Restart the API server
+5. Critical errors will be automatically sent to this webhook
+
+## Step 6: Run API Server (Optional)
 
 ```bash
 cd packages/api

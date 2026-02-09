@@ -15,10 +15,7 @@ async function checkCommit(id) {
     .single();
 
   if (commitError) {
-    console.error("Commit Error:", commitError);
   } else {
-    console.log("Commit found:", commit);
-
     // Check the repo
     const { data: repo, error: repoError } = await supabase
       .from("repos")
@@ -27,9 +24,7 @@ async function checkCommit(id) {
       .single();
 
     if (repoError) {
-      console.error("Repo Error:", repoError);
     } else {
-      console.log("Repo found:", repo);
     }
   }
 }

@@ -8,8 +8,6 @@ const supabase = createClient(
 );
 
 async function testQuery(commitId, userId) {
-  console.log(`Testing query for commit ${commitId} and user ${userId}`);
-
   const { data, error } = await supabase
     .from("commits")
     .select(
@@ -30,9 +28,7 @@ async function testQuery(commitId, userId) {
     .single();
 
   if (error) {
-    console.error("Query Error:", error);
   } else {
-    console.log("Query Success:", data);
   }
 }
 

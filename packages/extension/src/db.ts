@@ -23,14 +23,12 @@ export async function initDB(context: vscode.ExtensionContext) {
     if (fs.existsSync(dbPath)) {
         const fileBuffer = fs.readFileSync(dbPath)
         db = new SQL.Database(fileBuffer)
-        console.log("📁 Loaded existing DB")
 
         // Run migrations if needed
         await runMigrations(context)
     } else {
         db = new SQL.Database()
         await createInitialSchema(context)
-        console.log("🆕 Created new DB")
     }
 
     return db!
@@ -159,12 +157,8 @@ async function runMigrations(context: vscode.ExtensionContext) {
         currentVersion = 0
     }
 
-    console.log(`Current schema version: ${currentVersion}`)
-
     // Migration from v0 (old schema) to v2
     if (currentVersion === 0) {
-        console.log('Running migration: v0 -> v2')
-
         // Drop old table if exists and recreate with new schema
         try {
             // Check if old commits table exists
@@ -181,13 +175,11 @@ async function runMigrations(context: vscode.ExtensionContext) {
 
                 // No need to migrate old data as structure is completely different
                 // User will need to rescan
-                console.log('Old schema detected. Database recreated. Please rescan repositories.')
             } else {
                 // Fresh install
                 await createInitialSchema(context)
             }
         } catch (e) {
-            console.error('Migration error:', e)
             // Create fresh schema on error
             await createInitialSchema(context)
         }
@@ -195,8 +187,6 @@ async function runMigrations(context: vscode.ExtensionContext) {
 
     // Migration from v2 to v3: Add sync state tracking columns
     if (currentVersion === 2) {
-        console.log('Running migration: v2 -> v3 (Adding sync state tracking)')
-        
         try {
             // Add new columns to commits table
             db.run(`ALTER TABLE commits ADD COLUMN sync_status TEXT DEFAULT 'pending' CHECK(sync_status IN ('pending', 'syncing', 'synced', 'failed'))`)
@@ -220,10 +210,7 @@ async function runMigrations(context: vscode.ExtensionContext) {
             // Update schema version
             db.run('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)',
                 [3, new Date().toISOString()])
-            
-            console.log('✅ Migration v2 -> v3 completed successfully')
         } catch (e) {
-            console.error('❌ Migration v2 -> v3 failed:', e)
             throw e
         }
     }
@@ -414,7 +401,6 @@ export function addToSyncQueue(repoId: number, commitsJson: string, context: vsc
     
     // Reject payloads > 1MB
     if (payloadSize > 1024 * 1024) {
-        console.error(`Sync queue: Payload too large (${payloadSize} bytes), skipping`)
         return
     }
     
@@ -503,8 +489,6 @@ export function compactDatabase(context: vscode.ExtensionContext) {
 
     db = new SQL.Database(data)
     saveDB(context)
-
-    console.log('Database compacted')
 }
 
 export function exportDatabaseFile(context: vscode.ExtensionContext): string {
