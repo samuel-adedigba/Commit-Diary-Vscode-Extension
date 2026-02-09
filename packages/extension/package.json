@@ -3,7 +3,7 @@
   "displayName": "Commit Diary (Beta)",
   "preview": true,
   "description": "Track, categorize, and analyze your Git commits directly in VS Code.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "samuel-adedigba",
   "icon": "icon.png",
   "repository": {

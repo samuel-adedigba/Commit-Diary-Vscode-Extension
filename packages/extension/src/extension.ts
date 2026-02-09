@@ -48,6 +48,18 @@ let notificationManager: NotificationManager | null = null;
 
 // Track current branch for switch detection
 let currentBranch: string | null = null;
+
+// Function to generate diff summary for a commit
+async function generateDiffSummary(root: string, sha: string): Promise<string> {
+  try {
+    const git = simpleGit(root);
+    const diff = await git.show([`${sha}`, '--unified=3', '--no-color']);
+    return diff;
+  } catch (error) {
+    console.error(`Error generating diff for ${sha}:`, error);
+    return '';
+  }
+}
 let lastCommitCount: number = 0;
 
 /**
@@ -254,6 +266,9 @@ export async function activate(context: vscode.ExtensionContext) {
           component: f.component || undefined
         }));
 
+        // Generate diff summary for this commit
+        const diffSummary = await generateDiffSummary(root, commit.sha);
+
         const commitData: CommitInsertData = {
           sha: commit.sha,
           repoId,
@@ -264,7 +279,7 @@ export async function activate(context: vscode.ExtensionContext) {
           category: analysis.category,
           files: commit.files,
           components,
-          diffSummary: undefined,
+          diffSummary,
           contextTags: []
         };
 

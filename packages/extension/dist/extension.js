@@ -3024,12 +3024,10 @@ async function initDB(context) {
   if (fs.existsSync(dbPath)) {
     const fileBuffer = fs.readFileSync(dbPath);
     db = new SQL.Database(fileBuffer);
-    console.log("\u{1F4C1} Loaded existing DB");
     await runMigrations(context);
   } else {
     db = new SQL.Database();
     await createInitialSchema(context);
-    console.log("\u{1F195} Created new DB");
   }
   return db;
 }
@@ -3136,26 +3134,21 @@ async function runMigrations(context) {
   } catch (e) {
     currentVersion = 0;
   }
-  console.log(`Current schema version: ${currentVersion}`);
   if (currentVersion === 0) {
-    console.log("Running migration: v0 -> v2");
     try {
       const tableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='commits'");
       if (tableExists.length > 0) {
         const oldData = db.exec("SELECT * FROM commits");
         db.run("DROP TABLE IF EXISTS commits");
         await createInitialSchema(context);
-        console.log("Old schema detected. Database recreated. Please rescan repositories.");
       } else {
         await createInitialSchema(context);
       }
     } catch (e) {
-      console.error("Migration error:", e);
       await createInitialSchema(context);
     }
   }
   if (currentVersion === 2) {
-    console.log("Running migration: v2 -> v3 (Adding sync state tracking)");
     try {
       db.run(`ALTER TABLE commits ADD COLUMN sync_status TEXT DEFAULT 'pending' CHECK(sync_status IN ('pending', 'syncing', 'synced', 'failed'))`);
       db.run(`ALTER TABLE commits ADD COLUMN sync_batch_id TEXT`);
@@ -3170,9 +3163,7 @@ async function runMigrations(context) {
         "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
         [3, (/* @__PURE__ */ new Date()).toISOString()]
       );
-      console.log("\u2705 Migration v2 -> v3 completed successfully");
     } catch (e) {
-      console.error("\u274C Migration v2 -> v3 failed:", e);
       throw e;
     }
   }
@@ -3310,7 +3301,6 @@ function addToSyncQueue(repoId, commitsJson, context) {
   const payloadSize = Buffer.byteLength(commitsJson, "utf-8");
   const nextRetry = new Date(Date.now() + 60 * 60 * 1e3).toISOString();
   if (payloadSize > 1024 * 1024) {
-    console.error(`Sync queue: Payload too large (${payloadSize} bytes), skipping`);
     return;
   }
   db2.run(
@@ -3381,7 +3371,6 @@ function compactDatabase(context) {
   if (!SQL) throw new Error("SQL.js not initialized");
   db = new SQL.Database(data);
   saveDB(context);
-  console.log("Database compacted");
 }
 function exportDatabaseFile(context) {
   const dbPath = path2.join(context.globalStorageUri.fsPath, "commitdiary.sqlite");
@@ -8202,7 +8191,6 @@ async function getCommitsByIdentity(repoRoot, identityRegex, maxCount = 50, fiel
     }
     return commits;
   } catch (error) {
-    console.error("Error executing git log for identity:", error);
     return [];
   }
 }
@@ -8452,18 +8440,15 @@ var ComponentDetector = class {
       regex: new RegExp(rule.pattern),
       name: rule.name
     }));
-    console.log(`ComponentDetector: Loaded ${this.compiledRules.length} rules`);
   }
   getUserConfigRules() {
     try {
       const vscodeConfig = vscode4.workspace.getConfiguration("commitDiary");
       const userRules = vscodeConfig.get("componentRules");
       if (userRules && Array.isArray(userRules) && userRules.length > 0) {
-        console.log(`ComponentDetector: Using ${userRules.length} user-defined rules`);
         return userRules;
       }
     } catch (e) {
-      console.error("Error loading user component rules:", e);
     }
     return null;
   }
@@ -9563,6 +9548,16 @@ var syncManager = null;
 var authManager = null;
 var notificationManager = null;
 var currentBranch = null;
+async function generateDiffSummary(root, sha) {
+  try {
+    const git = esm_default(root);
+    const diff = await git.show([`${sha}`, "--unified=3", "--no-color"]);
+    return diff;
+  } catch (error) {
+    console.error(`Error generating diff for ${sha}:`, error);
+    return "";
+  }
+}
 var lastCommitCount = 0;
 async function checkFirstRunAndPromptRegistration(context, auth, output) {
   const hasSeenWelcome = context.globalState.get("hasSeenWelcome", false);
@@ -9709,6 +9704,7 @@ async function activate(context) {
           path: f.path,
           component: f.component || void 0
         }));
+        const diffSummary = await generateDiffSummary(root, commit.sha);
         const commitData = {
           sha: commit.sha,
           repoId,
@@ -9719,7 +9715,7 @@ async function activate(context) {
           category: analysis.category,
           files: commit.files,
           components,
-          diffSummary: void 0,
+          diffSummary,
           contextTags: []
         };
         insertCommit(commitData, context);

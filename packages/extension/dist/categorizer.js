@@ -111,11 +111,6 @@ function testEnhancements() {
         "update ui components",
         "dev mode first push"
     ];
-    console.log("🔧 Commit Message Enhancements:");
-    testMessages.forEach(msg => {
-        const analysis = categorizeCommit(msg);
-        console.log(`"${analysis.originalMessage}" → "${analysis.enhancedMessage}" [${analysis.category}]`);
-    });
 }
 function categorizeCommit(message) {
     const msg = (message || '').trim();
