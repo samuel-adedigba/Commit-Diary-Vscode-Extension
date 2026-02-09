@@ -23,7 +23,7 @@ async function initStepper() {
   if (FORCE_HTTP_MODE) {
   } else {
     try {
-      const stepperModule = await import("@commitdiary/stepper");
+      const stepperModule = await import("ai-inference-stepper");
       stepper = stepperModule;
       return;
     } catch (e) {}
