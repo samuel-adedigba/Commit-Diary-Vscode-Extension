@@ -2621,8 +2621,16 @@ app.post("/v1/stepper/callback", express.json(), async (req, res) => {
  */
 app.post("/v1/webhooks/report-completed", express.json(), async (req, res) => {
   try {
+    console.log('Webhook received:', {
+      headers: req.headers,
+      body: req.body,
+      hasWebhookSecret: !!process.env.WEBHOOK_SECRET,
+      webhookSecretLength: process.env.WEBHOOK_SECRET?.length
+    });
+
     // Validate webhook signature
     if (!validateWebhookSignature(req)) {
+      console.error('Webhook signature validation failed');
       return res.status(401).json({ error: "Invalid webhook signature" });
     }
 
