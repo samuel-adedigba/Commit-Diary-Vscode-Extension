@@ -17,6 +17,11 @@ import { initCronPoller } from "./cron/cronPoller.js";
 // Stepper Integration
 let stepper = null;
 const STEPPER_URL = process.env.STEPPER_URL || "http://localhost:3005";
+const STEPPER_API_KEY = process.env.STEPPER_API_KEY || "";
+const STEPPER_API_KEY_HEADER =
+  process.env.STEPPER_API_KEY_HEADER ||
+  process.env.API_KEY_HEADER ||
+  "x-api-key";
 const FORCE_HTTP_MODE = process.env.STEPPER_FORCE_HTTP === "true";
 
 async function initStepper() {
@@ -53,9 +58,14 @@ async function initStepper() {
           ],
         };
 
+        const headers = { "Content-Type": "application/json" };
+        if (STEPPER_API_KEY) {
+          headers[STEPPER_API_KEY_HEADER] = STEPPER_API_KEY;
+        }
+
         const response = await fetch(`${STEPPER_URL}/v1/reports`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify(requestBody),
         });
         const data = await response.json();
@@ -66,7 +76,13 @@ async function initStepper() {
     },
     getJob: async (jobId) => {
       try {
-        const response = await fetch(`${STEPPER_URL}/v1/reports/${jobId}`);
+        const headers = {};
+        if (STEPPER_API_KEY) {
+          headers[STEPPER_API_KEY_HEADER] = STEPPER_API_KEY;
+        }
+        const response = await fetch(`${STEPPER_URL}/v1/reports/${jobId}`, {
+          headers,
+        });
         return await response.json();
       } catch (err) {
         throw err;
