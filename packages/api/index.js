@@ -25,8 +25,7 @@ const STEPPER_API_KEY_HEADER =
 const FORCE_HTTP_MODE = process.env.STEPPER_FORCE_HTTP === "true";
 
 async function initStepper() {
-  if (FORCE_HTTP_MODE) {
-  } else {
+  if (!FORCE_HTTP_MODE) {
     try {
       const stepperModule = await import("ai-inference-stepper");
       stepper = stepperModule;
@@ -34,7 +33,7 @@ async function initStepper() {
     } catch (e) {}
   }
 
-  // HTTP Fallback implementation
+  // HTTP Fallback implementation (used when FORCE_HTTP_MODE is true)
   const API_BASE_URL =
     process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3001}`;
 
@@ -43,19 +42,10 @@ async function initStepper() {
       try {
         const requestBody = {
           ...input,
-          // Legacy callback for DB operations (job status updates)
+          // Single callback for both DB operations and Discord delivery
           callbackUrl: `${API_BASE_URL}/v1/webhooks/report-completed`,
-          // New callbacks array for immediate Discord delivery (bypasses DB failures)
-          callbacks: [
-            {
-              url: `${API_BASE_URL}/v1/stepper/callback`,
-              headers: {
-                "X-CommitDiary-Internal": "true",
-              },
-              continueOnFailure: true, // Don't fail the job if callback fails
-              retry: { maxAttempts: 2, delayMs: 1000 },
-            },
-          ],
+          // Remove immediate Discord callback to ensure atomic operations
+          callbacks: [],
         };
 
         const headers = { "Content-Type": "application/json" };
@@ -2618,44 +2608,426 @@ app.post("/v1/stepper/callback", express.json(), async (req, res) => {
 /**
  * Webhook endpoint for report completion
  * Called by Stepper when a report job completes
+ * Enhanced with retry logic and atomic operations
  */
 app.post("/v1/webhooks/report-completed", express.json(), async (req, res) => {
-  try {
-    console.log('Webhook received:', {
-      headers: req.headers,
-      body: req.body,
-      hasWebhookSecret: !!process.env.WEBHOOK_SECRET,
-      webhookSecretLength: process.env.WEBHOOK_SECRET?.length
-    });
-
-    // Validate webhook signature
-    if (!validateWebhookSignature(req)) {
-      console.error('Webhook signature validation failed');
-      return res.status(401).json({ error: "Invalid webhook signature" });
-    }
-
-    const { jobId, status, result, error, timestamp } = req.body;
-
-    if (!jobId) {
-      return res.status(400).json({ error: "Missing jobId" });
-    }
-
-    if (status === "completed" && result) {
-      // Report generation succeeded
-      // Get the job info to find commit_id for backfill tracking
-      const { data: jobInfo, error: jobError } = await supabaseAdmin
-        .from("report_jobs")
-        .select("commit_id, user_id")
-        .eq("job_id", jobId)
-        .single();
-
-      await reportService.completeJob(supabaseAdmin, jobId, result, {
-        generationType: "auto", // Default for webhook-delivered reports
+  const maxRetries = 3;
+  let attempt = 0;
+  
+  const processWebhook = async () => {
+    try {
+      console.log('🔔 Webhook received:', {
+        headers: {
+          'authorization': req.headers.authorization ? '[REDACTED]' : undefined,
+          'x-webhook-signature': req.headers['x-webhook-signature'] ? '[PRESENT]' : undefined,
+          'x-webhook-timestamp': req.headers['x-webhook-timestamp'],
+          'content-type': req.headers['content-type'],
+        },
+        body: req.body,
+        hasWebhookSecret: !!process.env.WEBHOOK_SECRET,
+        webhookSecretLength: process.env.WEBHOOK_SECRET?.length,
+        timestamp: new Date().toISOString(),
+        attempt: attempt + 1
       });
 
-      // Check if this commit is part of a backfill and update status
+      // Validate webhook signature
+      if (!validateWebhookSignature(req)) {
+        console.error('❌ Webhook signature validation failed', {
+          hasSecret: !!process.env.WEBHOOK_SECRET,
+          hasAuthHeader: !!req.headers.authorization,
+          hasSignature: !!req.headers['x-webhook-signature'],
+          hasTimestamp: !!req.headers['x-webhook-timestamp']
+        });
+        throw new Error("Invalid webhook signature");
+      }
+
+      const { jobId, status, result, error, timestamp } = req.body;
+
+      if (!jobId) {
+        console.error('❌ Missing jobId in webhook payload');
+        throw new Error("Missing jobId");
+      }
+
+      console.log(`✅ Webhook validated for job ${jobId}, status: ${status}`);
+
+      if (status === "completed" && result) {
+        // Report generation succeeded
+        console.log(`📝 Processing completed job ${jobId}`);
+        
+        // Get job info to find commit_id for backfill tracking
+        const { data: jobInfo, error: jobError } = await supabaseAdmin
+          .from("report_jobs")
+          .select("commit_id, user_id")
+          .eq("job_id", jobId)
+          .single();
+
+        if (jobError) {
+          console.error(`❌ Failed to find job info for ${jobId}:`, jobError);
+          throw new Error(`Job lookup failed: ${jobError.message}`);
+        }
+
+        console.log(`📋 Found job info: commit_id=${jobInfo.commit_id}, user_id=${jobInfo.user_id}`);
+
+        // Save to database - this is the critical operation
+        const saveResult = await reportService.completeJob(supabaseAdmin, jobId, result, {
+          generationType: "auto", // Default for webhook-delivered reports
+        });
+
+        if (!saveResult.success) {
+          console.error(`❌ Database save failed for job ${jobId}:`, saveResult.error);
+          throw new Error(`Database save failed: ${saveResult.error}`);
+        }
+
+        console.log(`✅ Report saved to database for job ${jobId}`);
+
+        // Send Discord notification ONLY after successful DB save
+        try {
+          await sendDiscordNotification(jobInfo.user_id, result, {
+            commitSha: req.body.metadata?.commitSha,
+            repo: req.body.metadata?.repo,
+            success: true,
+            jobId: jobId
+          });
+          console.log(`📤 Discord notification sent for job ${jobId}`);
+        } catch (discordError) {
+          console.error(`⚠️ Discord notification failed for job ${jobId}:`, discordError);
+          // Don't fail the operation, but log the error
+        }
+
+        // Check if this commit is part of a backfill and update status
+        if (jobInfo) {
+          const { data: backfill, error: backfillError } = await supabaseAdmin
+            .from("backfill_jobs")
+            .select("id, commit_details, repo_id")
+            .eq("user_id", jobInfo.user_id)
+            .eq("status", "processing")
+            .single();
+
+          if (backfill) {
+            const isBackfillCommit = (backfill.commit_details || []).some(
+              (d) => d.commitId === jobInfo.commit_id,
+            );
+            if (isBackfillCommit) {
+              console.log(`🔄 Updating backfill commit status for commit ${jobInfo.commit_id} in backfill ${backfill.id}`);
+              await reportService.updateBackfillCommitStatus(
+                supabaseAdmin,
+                backfill.id,
+                jobInfo.commit_id,
+                "completed",
+                jobId,
+              );
+              console.log(`✅ Backfill commit status updated`);
+            } else {
+              console.log(`ℹ️ Commit ${jobInfo.commit_id} is not part of active backfill`);
+            }
+          } else if (backfillError) {
+            console.error(`❌ Failed to find backfill for user ${jobInfo.user_id}:`, backfillError);
+          } else {
+            console.log(`ℹ️ No active backfill found for user ${jobInfo.user_id}`);
+          }
+        } else {
+          console.log(`ℹ️ No job info available for backfill tracking`);
+        }
+        
+        console.log(`✅ Webhook processed successfully for completed job ${jobId}`);
+        return { success: true, message: "Report saved and notifications sent" };
+      } 
+      
+      if (status === "failed" && error) {
+        // Report generation failed
+        console.log(`❌ Processing failed job ${jobId}:`, error);
+        
+        // Get job info to find commit_id for backfill tracking
+        const { data: jobInfo } = await supabaseAdmin
+          .from("report_jobs")
+          .select("commit_id, user_id")
+          .eq("job_id", jobId)
+          .single();
+
+        if (jobInfo) {
+          // Send failure Discord notification
+          try {
+            await sendDiscordNotification(jobInfo.user_id, null, {
+              commitSha: req.body.metadata?.commitSha,
+              repo: req.body.metadata?.repo,
+              success: false,
+              error: error,
+              jobId: jobId
+            });
+            console.log(`📤 Discord failure notification sent for job ${jobId}`);
+          } catch (discordError) {
+            console.error(`⚠️ Discord failure notification failed for job ${jobId}:`, discordError);
+          }
+
+          const { data: backfill } = await supabaseAdmin
+            .from("backfill_jobs")
+            .select("id, commit_details")
+            .eq("user_id", jobInfo.user_id)
+            .in("status", ["processing"])
+            .single();
+
+          if (backfill) {
+            const isBackfillCommit = (backfill.commit_details || []).some(
+              (d) => d.commitId === jobInfo.commit_id,
+            );
+            if (isBackfillCommit) {
+              console.log(`🔄 Updating backfill commit status to FAILED for commit ${jobInfo.commit_id} in backfill ${backfill.id}`);
+              await reportService.updateBackfillCommitStatus(
+                supabaseAdmin,
+                backfill.id,
+                jobInfo.commit_id,
+                "failed",
+                jobId,
+                error,
+              );
+              console.log(`✅ Backfill commit failure status updated`);
+            }
+          }
+        }
+        
+        // Mark job as failed in database
+        await reportService.markJobFailed(supabaseAdmin, jobId, error);
+        
+        console.log(`✅ Webhook processed successfully for failed job ${jobId}`);
+        return { success: true, message: "Failure recorded and notifications sent" };
+      }
+      
+      throw new Error(`Invalid webhook payload status: ${status}`);
+      
+    } catch (error) {
+      attempt++;
+      console.error(`Webhook processing attempt ${attempt} failed:`, {
+        error: error.message,
+        jobId: req.body.jobId,
+        timestamp: new Date().toISOString()
+      });
+      
+      if (attempt < maxRetries) {
+        // Exponential backoff: 1s, 2s, 4s
+        const delayMs = Math.pow(2, attempt - 1) * 1000;
+        console.log(`🔄 Retrying webhook processing in ${delayMs}ms (attempt ${attempt}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        return processWebhook();
+      }
+      
+      console.error(`❌ Webhook processing failed after ${maxRetries} attempts:`, error.message);
+      throw error;
+    }
+  };
+  
+  try {
+    const result = await processWebhook();
+    res.status(200).json(result);
+  } catch (error) {
+    console.error(`❌ Final webhook processing failed:`, {
+      error: error.message,
+      stack: error.stack,
+      timestamp: new Date().toISOString()
+    });
+    res.status(500).json({ error: "Webhook processing failed", message: error.message });
+  }
+});
+
+/**
+ * Send Discord notification for report completion/failure
+ * Centralized function for Discord delivery
+ */
+async function sendDiscordNotification(userId, result, options) {
+  try {
+    // Fetch user's webhook settings
+    const { data: webhookSettings } = await supabaseAdmin
+      .from("user_webhook_settings")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("enabled", true)
+      .single();
+
+    if (!webhookSettings) {
+      console.log(`ℹ️ No webhook settings configured for user ${userId}`);
+      return { success: false, message: "No webhook configured" };
+    }
+
+    const events = webhookSettings.events || [];
+    const webhookUrl = webhookSettings.discord_webhook_url;
+    const webhookSecret = webhookSettings.webhook_secret;
+
+    if (!webhookUrl) {
+      return { success: false, message: "No webhook URL" };
+    }
+
+    // Handle success case
+    if (options.success && result) {
+      if (!events.includes("report_completed")) {
+        return { success: false, message: "Event not subscribed" };
+      }
+
+      const payload = {
+        embeds: [
+          {
+            title: `✅ ${result.title || "Commit Report Generated"}`,
+            description: (
+              result.summary || "Report generated successfully"
+            ).substring(0, 2048),
+            color: 0x00ff00, // Green
+            fields: [
+              {
+                name: "📝 Commit",
+                value: `\`${options.commitSha?.substring(0, 7) || "Unknown"}\``,
+                inline: true,
+              },
+              {
+                name: "📦 Repository",
+                value: options.repo || "Unknown",
+                inline: true,
+              },
+              ...(result.category
+                ? [
+                    {
+                      name: "🏷️ Category",
+                      value: result.category,
+                      inline: true,
+                    },
+                  ]
+                : []),
+              ...(result.tags
+                ? [
+                    {
+                      name: "🔖 Tags",
+                      value: result.tags,
+                      inline: true,
+                    },
+                  ]
+                : []),
+              ...(result.changes &&
+              Array.isArray(result.changes) &&
+              result.changes.length > 0
+                ? [
+                    {
+                      name: "📋 Key Changes",
+                      value: result.changes
+                        .slice(0, 5)
+                        .map((c) => `• ${c}`)
+                        .join("\n")
+                        .substring(0, 1024),
+                      inline: false,
+                    },
+                  ]
+                : []),
+            ],
+            footer: {
+              text: `CommitDiary • Job ID: ${options.jobId}`,
+            },
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      };
+
+      const discordResult = await discordAlerts.sendDiscordWebhook({
+        webhookUrl,
+        payload,
+        secret: webhookSecret,
+        maxRetries: 3,
+      });
+
+      return { success: discordResult.success, statusCode: discordResult.statusCode };
+    }
+
+    // Handle failure case
+    if (!options.success && options.error) {
+      if (!events.includes("report_failed")) {
+        return { success: false, message: "Event not subscribed" };
+      }
+
+      const payload = {
+        embeds: [
+          {
+            title: "❌ Report Generation Failed",
+            description: `Failed to generate commit report for \`${options.commitSha?.substring(0, 7) || "Unknown"}\``,
+            color: 0xff0000, // Red
+            fields: [
+              {
+                name: "📦 Repository",
+                value: options.repo || "Unknown",
+                inline: true,
+              },
+              {
+                name: "❗ Error",
+                value: (options.error || "Unknown error").substring(0, 1024),
+                inline: false,
+              },
+              {
+                name: "🆔 Job ID",
+                value: options.jobId || "Unknown",
+                inline: true,
+              },
+            ],
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      };
+
+      const discordResult = await discordAlerts.sendDiscordWebhook({
+        webhookUrl,
+        payload,
+        secret: webhookSecret,
+        maxRetries: 2,
+      });
+
+      return { success: discordResult.success, statusCode: discordResult.statusCode };
+    }
+
+    return { success: false, message: "Invalid notification options" };
+  } catch (error) {
+    console.error(`❌ Discord notification failed:`, error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Debug endpoint to test webhook functionality
+ * This helps diagnose webhook issues without waiting for real report generation
+ */
+app.post("/v1/debug/test-webhook", express.json(), async (req, res) => {
+  try {
+    console.log('🧪 Debug webhook test called');
+    
+    const { jobId, status, commitId, repoId, userId } = req.body;
+    
+    if (!jobId || !status) {
+      return res.status(400).json({ 
+        error: "Missing required fields: jobId, status" 
+      });
+    }
+
+    console.log(`🧪 Testing webhook with:`, { jobId, status, commitId, repoId, userId });
+
+    // Simulate the webhook payload structure
+    const mockPayload = {
+      jobId,
+      status,
+      result: status === 'completed' ? { title: 'Test Report', summary: 'Test completion' } : undefined,
+      error: status === 'failed' ? 'Test error' : undefined,
+      timestamp: Date.now()
+    };
+
+    // Process it like a real webhook
+    if (status === "completed" && mockPayload.result) {
+      // Find job info if commitId provided
+      let jobInfo = null;
+      if (commitId) {
+        const { data } = await supabaseAdmin
+          .from("report_jobs")
+          .select("commit_id, user_id")
+          .eq("commit_id", commitId)
+          .single();
+        jobInfo = data;
+      }
+
       if (jobInfo) {
-        const { data: backfill, error: backfillError } = await supabaseAdmin
+        console.log(`🧪 Found job info: commit_id=${jobInfo.commit_id}, user_id=${jobInfo.user_id}`);
+        
+        // Check for backfill
+        const { data: backfill } = await supabaseAdmin
           .from("backfill_jobs")
           .select("id, commit_details, repo_id")
           .eq("user_id", jobInfo.user_id)
@@ -2667,6 +3039,7 @@ app.post("/v1/webhooks/report-completed", express.json(), async (req, res) => {
             (d) => d.commitId === jobInfo.commit_id,
           );
           if (isBackfillCommit) {
+            console.log(`🧪 Updating backfill commit status for commit ${jobInfo.commit_id}`);
             await reportService.updateBackfillCommitStatus(
               supabaseAdmin,
               backfill.id,
@@ -2674,60 +3047,271 @@ app.post("/v1/webhooks/report-completed", express.json(), async (req, res) => {
               "completed",
               jobId,
             );
-          }
-        } else if (backfillError) {
-        }
-      } else {
-      }
-      return res.status(200).json({ success: true, message: "Report saved" });
-    } else if (status === "failed" && error) {
-      // Report generation failed
-      // Get the job info to find commit_id for backfill tracking
-      const { data: jobInfo } = await supabaseAdmin
-        .from("report_jobs")
-        .select("commit_id, user_id")
-        .eq("job_id", jobId)
-        .single();
-
-      await reportService.markJobFailed(supabaseAdmin, jobId, error);
-
-      // Check if this commit is part of a backfill and update status
-      if (jobInfo) {
-        const { data: backfill } = await supabaseAdmin
-          .from("backfill_jobs")
-          .select("id, commit_details")
-          .eq("user_id", jobInfo.user_id)
-          .in("status", ["processing"])
-          .single();
-
-        if (backfill) {
-          const isBackfillCommit = (backfill.commit_details || []).some(
-            (d) => d.commitId === jobInfo.commit_id,
-          );
-          if (isBackfillCommit) {
-            await reportService.updateBackfillCommitStatus(
-              supabaseAdmin,
-              backfill.id,
-              jobInfo.commit_id,
-              "failed",
-              jobId,
-              error,
-            );
+            console.log(`🧪 ✅ Backfill commit status updated`);
           }
         }
       }
-      return res
-        .status(200)
-        .json({ success: true, message: "Failure recorded" });
-    } else {
-      return res.status(400).json({ error: "Invalid payload" });
     }
+
+    return res.status(200).json({ 
+      success: true, 
+      message: "Debug webhook test completed",
+      processed: mockPayload
+    });
+
   } catch (error) {
-    return res.status(500).json({ error: "Internal server error" });
+    console.error(`🧪 Debug webhook error:`, error);
+    return res.status(500).json({ error: "Debug webhook failed" });
   }
 });
 
-// ================== SERVER START ==================
+// Get pending jobs count for a repository
+app.get("/v1/repos/:repoId/jobs/pending", authMiddleware, async (req, res) => {
+  try {
+    const { repoId } = req.params;
+    const userId = req.userId;
+    
+    // Get all commit IDs for this repository
+    const { data: commits } = await supabaseAdmin
+      .from("commits")
+      .select("id")
+      .eq("repo_id", repoId)
+      .eq("user_id", userId);
+    
+    if (!commits || commits.length === 0) {
+      return res.json({ pendingCount: 0, failedCount: 0 });
+    }
+    
+    const commitIds = commits.map(c => c.id);
+    
+    // Get pending and failed jobs for these commits
+    const { data: pendingJobs, error: pendingError } = await supabaseAdmin
+      .from("report_jobs")
+      .select("status")
+      .in("commit_id", commitIds)
+      .eq("status", "pending");
+    
+    const { data: failedJobs, error: failedError } = await supabaseAdmin
+      .from("report_jobs")
+      .select("status")
+      .in("commit_id", commitIds)
+      .eq("status", "failed");
+    
+    const pendingCount = (pendingJobs || []).length;
+    const failedCount = (failedJobs || []).length;
+    
+    res.json({ 
+      pendingCount, 
+      failedCount,
+      totalJobs: pendingCount + failedCount
+    });
+  } catch (error) {
+    console.error(`Failed to get pending jobs for repo ${req.params.repoId}:`, error);
+    res.status(500).json({ error: "Failed to get pending jobs" });
+  }
+});
+
+// Manual job recovery endpoint
+app.post("/v1/jobs/recover", authMiddleware, async (req, res) => {
+  try {
+    console.log(`🔄 Manual job recovery triggered by user ${req.userId}`);
+    const results = await reportService.recoverStuckJobs(supabaseAdmin, 4); // 4 hour cutoff for manual recovery
+    
+    console.log(`📊 Manual recovery results:`, results);
+    
+    res.json({ 
+      success: true, 
+      message: "Job recovery completed",
+      results: {
+        recovered: results.recovered,
+        failed: results.failed,
+        errors: results.errors
+      }
+    });
+  } catch (error) {
+    console.error('Manual job recovery failed:', error);
+    res.status(500).json({ error: "Job recovery failed", message: error.message });
+  }
+});
+
+// Debug endpoint to test stepper connection
+app.get("/v1/debug/stepper", async (req, res) => {
+  try {
+    if (!stepper) {
+      return res.json({ error: "Stepper not initialized" });
+    }
+    
+    const testInput = {
+      userId: "test",
+      commitSha: "abc123",
+      repo: "test-repo",
+      message: "test commit",
+      files: ["test.js"],
+      components: [],
+      diffSummary: "test changes"
+    };
+    
+    const result = await stepper.enqueueReport(testInput);
+    res.json({ success: true, result });
+  } catch (error) {
+    console.error('Stepper test failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manual backfill recovery endpoint
+app.post("/v1/debug/recover-backfill/:repoId", async (req, res) => {
+  try {
+    const { repoId } = req.params;
+    const userId = "test"; // Hardcoded for debugging
+    
+    if (!stepper) {
+      return res.json({ error: "Stepper not initialized" });
+    }
+    
+    // Get stuck backfill
+    const { data: backfill } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("*")
+      .eq("repo_id", repoId)
+      .eq("status", "processing")
+      .single();
+    
+    if (!backfill) {
+      return res.json({ error: "No stuck backfill found" });
+    }
+    
+    console.log(`🔄 Recovering backfill ${backfill.id} for repo ${repoId}`);
+    
+    // Get commits for this backfill
+    const commitIds = backfill.commit_details.map(d => d.commitId);
+    const { data: commits } = await supabaseAdmin
+      .from("commits")
+      .select("*")
+      .in("id", commitIds);
+    
+    let processed = 0;
+    
+    // Process each stuck commit
+    for (const commit of commits) {
+      const commitDetail = backfill.commit_details.find(d => d.commitId === commit.id);
+      
+      if (commitDetail.status === "pending" && !commitDetail.jobId) {
+        try {
+          const promptInput = {
+            userId,
+            commitSha: commit.sha,
+            repo: commit.repos?.name || "unknown",
+            message: commit.message || "",
+            files: (commit.files || []).map((f) => f.path || f),
+            components: commit.components || [],
+            diffSummary: commit.diff_summary || "",
+          };
+
+          console.log(`📤 Enqueuing job for commit ${commit.sha}`);
+          const result = await stepper.enqueueReport(promptInput);
+
+          if (result.status === 202 && result.jobId) {
+            // Job enqueued - update backfill status
+            await reportService.updateBackfillCommitStatus(
+              supabaseAdmin,
+              backfill.id,
+              commit.id,
+              "processing",
+              result.jobId,
+            );
+            
+            // Create job tracking
+            await reportService.createReportJob(supabaseAdmin, {
+              commitId: commit.id,
+              userId,
+              jobId: result.jobId,
+            });
+            
+            processed++;
+          } else if (result.status === 200 && result.cached) {
+            // Cached hit - save directly
+            await reportService.saveCachedReport(
+              supabaseAdmin,
+              commit.id,
+              userId,
+              result.data,
+              { provider: "cached", generationType: "backfill" },
+            );
+
+            await reportService.updateBackfillCommitStatus(
+              supabaseAdmin,
+              backfill.id,
+              commit.id,
+              "completed",
+            );
+            
+            processed++;
+          }
+        } catch (err) {
+          console.error(`❌ Failed to process commit ${commit.sha}:`, err);
+          await reportService.updateBackfillCommitStatus(
+            supabaseAdmin,
+            backfill.id,
+            commit.id,
+            "failed",
+            null,
+            err.message,
+          );
+        }
+      }
+    }
+    
+    res.json({ 
+      success: true, 
+      message: `Processed ${processed} commits`,
+      processed 
+    });
+  } catch (error) {
+    console.error('Backfill recovery failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get system health and job statistics
+app.get("/v1/system/health", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    // Get job statistics for this user
+    const { data: pendingJobs } = await supabaseAdmin
+      .from("report_jobs")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("status", "pending");
+    
+    const { data: failedJobs } = await supabaseAdmin
+      .from("report_jobs")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("status", "failed");
+    
+    // Get active backfills
+    const { data: activeBackfills } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("status", "processing");
+    
+    res.json({
+      status: "healthy",
+      timestamp: new Date().toISOString(),
+      statistics: {
+        pendingJobs: (pendingJobs || []).length,
+        failedJobs: (failedJobs || []).length,
+        activeBackfills: (activeBackfills || []).length,
+      }
+    });
+  } catch (error) {
+    console.error('System health check failed:', error);
+    res.status(500).json({ error: "Health check failed" });
+  }
+});
 
 // Global error handler for uncaught errors
 app.use((err, req, res, next) => {

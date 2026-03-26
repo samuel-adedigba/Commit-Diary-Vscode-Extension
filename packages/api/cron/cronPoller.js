@@ -17,6 +17,7 @@ import {
   markJobFailed,
   completeJob,
   cleanupStaleJobs,
+  recoverStuckJobs,
 } from "../services/reportService.js";
 
 // Polling state
@@ -53,6 +54,25 @@ export function initCronPoller({
       cleanupStaleJobs(supabaseAdmin, 6); // 6 hour max
     },
     60 * 60 * 1000,
+  );
+
+  // Run job recovery every 30 minutes
+  setInterval(
+    async () => {
+      console.log('🔄 Running automatic job recovery...');
+      try {
+        const results = await recoverStuckJobs(supabaseAdmin, 2); // 2 hour cutoff
+        if (results.recovered > 0 || results.failed > 0) {
+          console.log(`📊 Recovery results: ${results.recovered} recovered, ${results.failed} failed`);
+        }
+        if (results.errors.length > 0) {
+          console.error(`⚠️ Recovery errors:`, results.errors);
+        }
+      } catch (error) {
+        console.error('❌ Automatic job recovery failed:', error);
+      }
+    },
+    30 * 60 * 1000, // 30 minutes
   );
 
   // Run once immediately

@@ -751,6 +751,15 @@ export async function updateBackfillCommitStatus(
   errorMsg = null,
 ) {
   try {
+    console.log(`🔄 updateBackfillCommitStatus called:`, {
+      backfillId,
+      commitId,
+      status,
+      jobId,
+      errorMsg,
+      timestamp: new Date().toISOString()
+    });
+
     // Get current backfill job
     const { data: backfill, error: fetchError } = await supabaseAdmin
       .from("backfill_jobs")
@@ -759,12 +768,23 @@ export async function updateBackfillCommitStatus(
       .single();
 
     if (fetchError || !backfill) {
+      console.error(`❌ Failed to fetch backfill ${backfillId}:`, fetchError);
       return;
     }
+
+    console.log(`📋 Current backfill status:`, {
+      id: backfill.id,
+      status: backfill.status,
+      totalCommits: backfill.total_commits,
+      completedCommits: backfill.completed_commits,
+      failedCommits: backfill.failed_commits,
+      commitDetailsCount: backfill.commit_details?.length || 0
+    });
 
     // Update the specific commit in commit_details
     const details = backfill.commit_details.map((d) => {
       if (d.commitId === commitId) {
+        console.log(`🔄 Updating commit ${commitId} from ${d.status} to ${status}`);
         return { ...d, status, jobId: jobId || d.jobId, error: errorMsg };
       }
       return d;
@@ -776,6 +796,13 @@ export async function updateBackfillCommitStatus(
     ).length;
     const failedCount = details.filter((d) => d.status === "failed").length;
     const totalDone = completedCount + failedCount;
+
+    console.log(`📊 Updated counts:`, {
+      completed: completedCount,
+      failed: failedCount,
+      totalDone,
+      totalCommits: backfill.total_commits
+    });
 
     // Determine overall status
     let overallStatus = "processing";
@@ -789,6 +816,8 @@ export async function updateBackfillCommitStatus(
       }
     }
     
+    console.log(`🎯 New overall status: ${overallStatus}`);
+
     const { error: updateError } = await supabaseAdmin
       .from("backfill_jobs")
       .update({
@@ -804,10 +833,16 @@ export async function updateBackfillCommitStatus(
       .eq("id", backfillId);
 
     if (updateError) {
+      console.error(`❌ Failed to update backfill ${backfillId}:`, updateError);
+      return;
     }
+
+    console.log(`✅ Successfully updated backfill ${backfillId}`);
 
     // If all completed successfully, enable reports for the repo
     if (overallStatus === "completed") {
+      console.log(`🎉 Backfill completed! Enabling reports for repo ${backfill.repo_id}`);
+      
       const { error: enableError } = await supabaseAdmin
         .from("repos")
         .update({ enable_reports: true })
@@ -815,9 +850,22 @@ export async function updateBackfillCommitStatus(
         .eq("user_id", backfill.user_id);
       
       if (enableError) {
+        console.error(`❌ Failed to enable reports for repo ${backfill.repo_id}:`, enableError);
+      } else {
+        console.log(`✅ Reports enabled for repo ${backfill.repo_id}`);
       }
+    } else if (overallStatus === "partial") {
+      console.log(`⚠️ Backfill partially completed. Consider enabling reports anyway?`);
+      // TODO: Consider enabling reports for partial success
     }
   } catch (error) {
+    console.error(`❌ updateBackfillCommitStatus error:`, {
+      error: error.message,
+      stack: error.stack,
+      backfillId,
+      commitId,
+      status
+    });
   }
 }
 
@@ -914,6 +962,179 @@ export async function resetBackfillForRetry(supabaseAdmin, repoId, userId) {
     return { success: true, backfill: data };
   } catch (error) {
     return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Recover stuck jobs that completed in Stepper but failed to save to database
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {number} maxAgeHours - Maximum age for jobs to recover (default: 2 hours)
+ * @returns {Promise<{recovered: number, failed: number, errors: string[]}>}
+ */
+export async function recoverStuckJobs(supabaseAdmin, maxAgeHours = 2) {
+  const cutoffTime = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+  const results = { recovered: 0, failed: 0, errors: [] };
+  
+  try {
+    console.log(`🔄 Starting job recovery for jobs older than ${maxAgeHours} hours...`);
+    
+    // Find jobs stuck in "pending" state that are older than cutoff
+    const { data: stuckJobs, error: fetchError } = await supabaseAdmin
+      .from("report_jobs")
+      .select("*")
+      .eq("status", "pending")
+      .lt("created_at", cutoffTime)
+      .order("created_at", { ascending: false })
+      .limit(50); // Process in batches
+
+    if (fetchError) {
+      throw new Error(`Failed to fetch stuck jobs: ${fetchError.message}`);
+    }
+
+    if (!stuckJobs || stuckJobs.length === 0) {
+      console.log(`ℹ️ No stuck jobs found for recovery`);
+      return results;
+    }
+
+    console.log(`📋 Found ${stuckJobs.length} stuck jobs for recovery`);
+
+    // Import stepper module for job status checking
+    let stepper = null;
+    try {
+      const stepperModule = await import("ai-inference-stepper");
+      stepper = stepperModule;
+    } catch (e) {
+      // Fallback to HTTP implementation
+      const STEPPER_URL = process.env.STEPPER_URL || "http://localhost:3005";
+      const STEPPER_API_KEY = process.env.STEPPER_API_KEY || "";
+      const STEPPER_API_KEY_HEADER = process.env.STEPPER_API_KEY_HEADER || "x-api-key";
+      
+      stepper = {
+        getJob: async (jobId) => {
+          try {
+            const headers = {};
+            if (STEPPER_API_KEY) {
+              headers[STEPPER_API_KEY_HEADER] = STEPPER_API_KEY;
+            }
+            const response = await fetch(`${STEPPER_URL}/v1/reports/${jobId}`, {
+              headers,
+            });
+            return await response.json();
+          } catch (err) {
+            return null;
+          }
+        },
+      };
+    }
+
+    // Process each stuck job
+    for (const job of stuckJobs) {
+      try {
+        console.log(`🔍 Checking job ${job.job_id} (created: ${job.created_at})`);
+        
+        // Check with Stepper if job actually completed
+        const stepperStatus = await stepper.getJob(job.job_id);
+        
+        if (!stepperStatus) {
+          console.log(`⚠️ Job ${job.job_id} not found in Stepper, marking as failed`);
+          await markJobFailed(supabaseAdmin, job.job_id, "Job not found in Stepper");
+          results.failed++;
+          continue;
+        }
+
+        console.log(`📊 Job ${job.job_id} status in Stepper: ${stepperStatus.state}`);
+
+        if (stepperStatus.state === 'completed' && stepperStatus.result) {
+          // Job completed but webhook failed - try to recover it
+          console.log(`💾 Attempting to recover completed job ${job.job_id}`);
+          
+          const reportData = stepperStatus.result.result || stepperStatus.result;
+          const metadata = {
+            provider: stepperStatus.result.usedProvider,
+            generationTimeMs: stepperStatus.result.timings?.totalMs,
+            generationType: "recovered",
+          };
+
+          const saveResult = await completeJob(supabaseAdmin, job.job_id, reportData, metadata);
+          
+          if (saveResult.success) {
+            console.log(`✅ Successfully recovered job ${job.job_id}`);
+            results.recovered++;
+            
+            // Update backfill status if applicable
+            await updateBackfillForRecoveredJob(supabaseAdmin, job, "completed");
+          } else {
+            console.error(`❌ Failed to save recovered job ${job.job_id}: ${saveResult.error}`);
+            await markJobFailed(supabaseAdmin, job.job_id, `Recovery failed: ${saveResult.error}`);
+            results.failed++;
+            results.errors.push(`Job ${job.job_id}: ${saveResult.error}`);
+          }
+        } else if (stepperStatus.state === 'failed') {
+          // Job failed in Stepper - mark as failed here too
+          console.log(`❌ Job ${job.job_id} failed in Stepper: ${stepperStatus.failedReason}`);
+          await markJobFailed(supabaseAdmin, job.job_id, stepperStatus.failedReason || "Stepper job failed");
+          results.failed++;
+          
+          // Update backfill status if applicable
+          await updateBackfillForRecoveredJob(supabaseAdmin, job, "failed", stepperStatus.failedReason);
+        } else {
+          // Job is still active in Stepper - leave it pending
+          console.log(`⏳ Job ${job.job_id} still active in Stepper (${stepperStatus.state}), leaving pending`);
+        }
+      } catch (jobError) {
+        console.error(`❌ Error processing job ${job.job_id}:`, jobError);
+        results.errors.push(`Job ${job.job_id}: ${jobError.message}`);
+        results.failed++;
+      }
+    }
+
+    console.log(`🏁 Job recovery completed: ${results.recovered} recovered, ${results.failed} failed, ${results.errors.length} errors`);
+    return results;
+    
+  } catch (error) {
+    console.error(`❌ Job recovery process failed:`, error);
+    results.errors.push(`Recovery process: ${error.message}`);
+    return results;
+  }
+}
+
+/**
+ * Update backfill status for recovered jobs
+ * @param {Object} supabaseAdmin - Supabase admin client
+ * @param {Object} job - Job record
+ * @param {string} status - 'completed' or 'failed'
+ * @param {string} error - Error message (for failed jobs)
+ */
+async function updateBackfillForRecoveredJob(supabaseAdmin, job, status, error = null) {
+  try {
+    // Find active backfill for this user
+    const { data: backfill } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("id, commit_details")
+      .eq("user_id", job.user_id)
+      .eq("status", "processing")
+      .single();
+
+    if (backfill) {
+      const isBackfillCommit = (backfill.commit_details || []).some(
+        (d) => d.commitId === job.commit_id,
+      );
+      
+      if (isBackfillCommit) {
+        console.log(`🔄 Updating backfill status for recovered job ${job.job_id}`);
+        await updateBackfillCommitStatus(
+          supabaseAdmin,
+          backfill.id,
+          job.commit_id,
+          status,
+          job.job_id,
+          error
+        );
+        console.log(`✅ Backfill status updated for recovered job ${job.job_id}`);
+      }
+    }
+  } catch (error) {
+    console.error(`⚠️ Failed to update backfill for recovered job ${job.job_id}:`, error);
   }
 }
 
