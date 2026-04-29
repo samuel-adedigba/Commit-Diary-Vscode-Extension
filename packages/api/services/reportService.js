@@ -9,6 +9,7 @@
  */
 
 import * as discordAlerts from "../alerts/discord.js";
+import { createStepperClient } from "../clients/stepperClient.js";
 
 /**
  * Handle network/timeout errors with graceful degradation
@@ -115,7 +116,7 @@ export async function toggleReports(supabaseAdmin, repoId, userId, enabled) {
  */
 export async function createReportJob(
   supabaseAdmin,
-  { commitId, userId, jobId },
+  { commitId, userId, jobId, repoId = null, backfillId = null },
 ) {
   if (!jobId) {
     return { success: false, error: "jobId is required" };
@@ -135,19 +136,58 @@ export async function createReportJob(
   }
 
   // Create new job entry
+  const jobInsertPayload = {
+    commit_id: commitId,
+    user_id: userId,
+    job_id: jobId,
+    status: "pending",
+    next_poll_at: new Date().toISOString(),
+  };
+
+  // Best-effort metadata attachment for installations that already added these columns.
+  if (repoId) {
+    jobInsertPayload.repo_id = repoId;
+  }
+  if (backfillId) {
+    jobInsertPayload.backfill_id = backfillId;
+  }
+
   const { data, error } = await supabaseAdmin
     .from("report_jobs")
-    .insert({
-      commit_id: commitId,
-      user_id: userId,
-      job_id: jobId,
-      status: "pending",
-      next_poll_at: new Date().toISOString(),
-    })
+    .insert(jobInsertPayload)
     .select()
     .single();
 
   if (error) {
+    // Handle installations that have not yet migrated to include repo_id/backfill_id columns.
+    if (
+      (repoId || backfillId) &&
+      error.message &&
+      (error.message.includes("repo_id") || error.message.includes("backfill_id"))
+    ) {
+      const fallbackPayload = {
+        commit_id: commitId,
+        user_id: userId,
+        job_id: jobId,
+        status: "pending",
+        next_poll_at: new Date().toISOString(),
+      };
+      const { data: fallbackData, error: fallbackError } = await supabaseAdmin
+        .from("report_jobs")
+        .insert(fallbackPayload)
+        .select()
+        .single();
+
+      if (fallbackError) {
+        if (fallbackError.code === "23505") {
+          return { success: true, jobId, existing: true };
+        }
+        return { success: false, error: fallbackError.message };
+      }
+
+      return { success: true, jobId: fallbackData.job_id };
+    }
+
     // Handle unique constraint violation (race condition)
     if (error.code === "23505") {
       return { success: true, jobId, existing: true };
@@ -366,7 +406,7 @@ export async function completeJob(
   // Get the job info first
   const { data: job, error: jobError } = await supabaseAdmin
     .from("report_jobs")
-    .select("commit_id, user_id")
+    .select("commit_id, user_id, repo_id, backfill_id")
     .eq("job_id", jobId)
     .single();
 
@@ -405,14 +445,18 @@ export async function completeJob(
     return { success: false, error: reportError.message };
   }
 
-  // 2. Delete the job (it's complete)
-  const { error: deleteError } = await supabaseAdmin
+  // 2. Mark the job as terminal/completed for short-term auditability.
+  const { error: finalizeError } = await supabaseAdmin
     .from("report_jobs")
-    .delete()
+    .update({
+      status: "completed",
+      error_message: null,
+      last_polled_at: new Date().toISOString(),
+    })
     .eq("job_id", jobId);
 
-  if (deleteError) {
-    // Job is complete but not cleaned up - not critical
+  if (finalizeError) {
+    // Report is already saved; do not fail completion for terminal-state update issues.
   }
 
   // 3. Send Discord webhook notification if user has it configured
@@ -457,7 +501,15 @@ export async function completeJob(
     // Don't fail the job if webhook fails
   }
 
-  return { success: true };
+  return {
+    success: true,
+    job: {
+      commitId: job.commit_id,
+      userId: job.user_id,
+      repoId: job.repo_id || null,
+      backfillId: job.backfill_id || null,
+    },
+  };
 }
 
 /**
@@ -510,7 +562,9 @@ export async function getJobStatus(supabaseAdmin, commitId, userId) {
       .select("*")
       .eq("commit_id", commitId)
       .eq("user_id", userId)
-      .single();
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (error) {
       if (error.code !== "PGRST116") {
@@ -528,6 +582,49 @@ export async function getJobStatus(supabaseAdmin, commitId, userId) {
       return null;
     }
     throw error;
+  }
+}
+
+/**
+ * Find active backfill for a commit with repo-scoped matching.
+ * This avoids ambiguous user-only backfill lookups.
+ */
+export async function findActiveBackfillForCommit(
+  supabaseAdmin,
+  { userId, commitId, repoId = null },
+) {
+  try {
+    let resolvedRepoId = repoId;
+    if (!resolvedRepoId) {
+      const { data: commit } = await supabaseAdmin
+        .from("commits")
+        .select("repo_id")
+        .eq("id", commitId)
+        .eq("user_id", userId)
+        .single();
+      resolvedRepoId = commit?.repo_id || null;
+    }
+
+    if (!resolvedRepoId) {
+      return null;
+    }
+
+    const { data: backfills } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("id, commit_details, repo_id")
+      .eq("user_id", userId)
+      .eq("repo_id", resolvedRepoId)
+      .eq("status", "processing")
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    const matched = (backfills || []).find((backfill) =>
+      (backfill.commit_details || []).some((d) => d.commitId === commitId),
+    );
+
+    return matched || null;
+  } catch (error) {
+    return null;
   }
 }
 
@@ -899,6 +996,77 @@ export async function getBackfillStatus(supabaseAdmin, repoId, userId) {
 }
 
 /**
+ * Build recovery metadata for a backfill lifecycle.
+ */
+export async function getBackfillRecoveryMetadata(
+  supabaseAdmin,
+  { backfill, userId, repoId },
+) {
+  if (!backfill) {
+    return null;
+  }
+
+  const details = backfill.commit_details || [];
+  const pendingCommitIds = details
+    .filter((d) => d.status === "processing" || d.status === "pending")
+    .map((d) => d.commitId);
+
+  let nextRecoveryAt = null;
+  let pendingJobsCount = 0;
+  let stalePendingJobsCount = 0;
+
+  if (pendingCommitIds.length > 0) {
+    const { data: jobs } = await supabaseAdmin
+      .from("report_jobs")
+      .select("next_poll_at, created_at, status")
+      .eq("user_id", userId)
+      .eq("repo_id", repoId)
+      .in("commit_id", pendingCommitIds)
+      .eq("status", "pending")
+      .order("next_poll_at", { ascending: true });
+
+    const now = Date.now();
+    const staleCutoffMs = 2 * 60 * 60 * 1000;
+    const normalizedJobs = jobs || [];
+    pendingJobsCount = normalizedJobs.length;
+    nextRecoveryAt = normalizedJobs[0]?.next_poll_at || null;
+    stalePendingJobsCount = normalizedJobs.filter((job) => {
+      const createdAt = new Date(job.created_at).getTime();
+      return now - createdAt > staleCutoffMs;
+    }).length;
+  }
+
+  const completedCount = backfill.completed_commits || 0;
+  const failedCount = backfill.failed_commits || 0;
+  const total = backfill.total_commits || 0;
+  const inFlightCount = details.filter((d) => d.status === "processing").length;
+  const untouchedPendingCount = details.filter((d) => d.status === "pending").length;
+
+  let estimatedState = "processing";
+  if (backfill.status === "completed") {
+    estimatedState = "completed";
+  } else if (backfill.status === "failed") {
+    estimatedState = "failed";
+  } else if (backfill.status === "partial") {
+    estimatedState = "partial";
+  } else if (stalePendingJobsCount > 0 && inFlightCount > 0) {
+    estimatedState = "recovery_due";
+  } else if (inFlightCount > 0 || pendingJobsCount > 0) {
+    estimatedState = "awaiting_stepper";
+  } else if (untouchedPendingCount > 0 && completedCount + failedCount < total) {
+    estimatedState = "queued";
+  }
+
+  return {
+    lastProgressAt: backfill.updated_at || backfill.created_at,
+    nextRecoveryAt,
+    estimatedState,
+    pendingJobsCount,
+    stalePendingJobsCount,
+  };
+}
+
+/**
  * Get failed commits from a backfill job for retry
  * @param {Object} supabaseAdmin - Supabase admin client
  * @param {number} repoId - Repository ID
@@ -998,34 +1166,11 @@ export async function recoverStuckJobs(supabaseAdmin, maxAgeHours = 2) {
 
     console.log(`📋 Found ${stuckJobs.length} stuck jobs for recovery`);
 
-    // Import stepper module for job status checking
-    let stepper = null;
-    try {
-      const stepperModule = await import("ai-inference-stepper");
-      stepper = stepperModule;
-    } catch (e) {
-      // Fallback to HTTP implementation
-      const STEPPER_URL = process.env.STEPPER_URL || "http://localhost:3005";
-      const STEPPER_API_KEY = process.env.STEPPER_API_KEY || "";
-      const STEPPER_API_KEY_HEADER = process.env.STEPPER_API_KEY_HEADER || "x-api-key";
-      
-      stepper = {
-        getJob: async (jobId) => {
-          try {
-            const headers = {};
-            if (STEPPER_API_KEY) {
-              headers[STEPPER_API_KEY_HEADER] = STEPPER_API_KEY;
-            }
-            const response = await fetch(`${STEPPER_URL}/v1/reports/${jobId}`, {
-              headers,
-            });
-            return await response.json();
-          } catch (err) {
-            return null;
-          }
-        },
-      };
-    }
+    const stepper = await createStepperClient({
+      forceHttp: process.env.STEPPER_FORCE_HTTP === "true",
+      callbackUrl: null,
+      callbacks: [],
+    });
 
     // Process each stuck job
     for (const job of stuckJobs) {
@@ -1107,31 +1252,23 @@ export async function recoverStuckJobs(supabaseAdmin, maxAgeHours = 2) {
  */
 async function updateBackfillForRecoveredJob(supabaseAdmin, job, status, error = null) {
   try {
-    // Find active backfill for this user
-    const { data: backfill } = await supabaseAdmin
-      .from("backfill_jobs")
-      .select("id, commit_details")
-      .eq("user_id", job.user_id)
-      .eq("status", "processing")
-      .single();
+    const backfill = await findActiveBackfillForCommit(supabaseAdmin, {
+      userId: job.user_id,
+      commitId: job.commit_id,
+      repoId: job.repo_id || null,
+    });
 
     if (backfill) {
-      const isBackfillCommit = (backfill.commit_details || []).some(
-        (d) => d.commitId === job.commit_id,
+      console.log(`🔄 Updating backfill status for recovered job ${job.job_id}`);
+      await updateBackfillCommitStatus(
+        supabaseAdmin,
+        backfill.id,
+        job.commit_id,
+        status,
+        job.job_id,
+        error
       );
-      
-      if (isBackfillCommit) {
-        console.log(`🔄 Updating backfill status for recovered job ${job.job_id}`);
-        await updateBackfillCommitStatus(
-          supabaseAdmin,
-          backfill.id,
-          job.commit_id,
-          status,
-          job.job_id,
-          error
-        );
-        console.log(`✅ Backfill status updated for recovered job ${job.job_id}`);
-      }
+      console.log(`✅ Backfill status updated for recovered job ${job.job_id}`);
     }
   } catch (error) {
     console.error(`⚠️ Failed to update backfill for recovered job ${job.job_id}:`, error);

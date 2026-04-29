@@ -13,75 +13,31 @@ import * as discordAlerts from "./alerts/discord.js";
 // Report service imports
 import * as reportService from "./services/reportService.js";
 import { initCronPoller } from "./cron/cronPoller.js";
+import { createStepperClient } from "./clients/stepperClient.js";
+import { createReportingRouter } from "./routes/reporting.routes.js";
+import { createJobsRouter } from "./routes/jobs.routes.js";
+import { createReportActionsRouter } from "./routes/report-actions.routes.js";
+import { createReportWebhooksRouter } from "./routes/report-webhooks.routes.js";
 
 // Stepper Integration
 let stepper = null;
-const STEPPER_URL = process.env.STEPPER_URL || "http://localhost:3005";
-const STEPPER_API_KEY = process.env.STEPPER_API_KEY || "";
-const STEPPER_API_KEY_HEADER =
-  process.env.STEPPER_API_KEY_HEADER ||
-  process.env.API_KEY_HEADER ||
-  "x-api-key";
 const FORCE_HTTP_MODE = process.env.STEPPER_FORCE_HTTP === "true";
+const API_BASE_URL =
+  process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3001}`;
 
 async function initStepper() {
-  if (!FORCE_HTTP_MODE) {
-    try {
-      const stepperModule = await import("ai-inference-stepper");
-      stepper = stepperModule;
-      return;
-    } catch (e) {}
-  }
-
-  // HTTP Fallback implementation (used when FORCE_HTTP_MODE is true)
-  const API_BASE_URL =
-    process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3001}`;
-
-  stepper = {
-    enqueueReport: async (input) => {
-      try {
-        const requestBody = {
-          ...input,
-          // Single callback for both DB operations and Discord delivery
-          callbackUrl: `${API_BASE_URL}/v1/webhooks/report-completed`,
-          // Remove immediate Discord callback to ensure atomic operations
-          callbacks: [],
-        };
-
-        const headers = { "Content-Type": "application/json" };
-        if (STEPPER_API_KEY) {
-          headers[STEPPER_API_KEY_HEADER] = STEPPER_API_KEY;
-        }
-
-        const response = await fetch(`${STEPPER_URL}/v1/reports`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(requestBody),
-        });
-        const data = await response.json();
-        return { status: response.status, ...data };
-      } catch (err) {
-        throw err;
-      }
-    },
-    getJob: async (jobId) => {
-      try {
-        const headers = {};
-        if (STEPPER_API_KEY) {
-          headers[STEPPER_API_KEY_HEADER] = STEPPER_API_KEY;
-        }
-        const response = await fetch(`${STEPPER_URL}/v1/reports/${jobId}`, {
-          headers,
-        });
-        return await response.json();
-      } catch (err) {
-        throw err;
-      }
-    },
-  };
+  stepper = await createStepperClient({
+    forceHttp: FORCE_HTTP_MODE,
+    callbackUrl: `${API_BASE_URL}/v1/webhooks/report-completed`,
+    callbacks: [],
+  });
+  console.log(`✅ Stepper client initialized in ${stepper.mode} mode`);
 }
 
-initStepper();
+const stepperInitPromise = initStepper().catch((error) => {
+  console.error("❌ Failed to initialize Stepper client:", error?.message || error);
+  stepper = null;
+});
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -280,6 +236,50 @@ async function authMiddleware(req, res, next) {
     res.status(500).json({ error: "Authentication failed" });
   }
 }
+
+const ENABLE_DEBUG_ROUTES = process.env.ENABLE_DEBUG_ROUTES === "true";
+
+async function debugRouteMiddleware(req, res, next) {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ error: "Not found" });
+  }
+
+  return authMiddleware(req, res, next);
+}
+
+app.use(
+  createReportingRouter({
+    authMiddleware,
+    supabaseAdmin,
+    getStepper: () => stepper,
+    reportService,
+  }),
+);
+
+app.use(
+  createJobsRouter({
+    authMiddleware,
+    supabaseAdmin,
+    getStepper: () => stepper,
+    reportService,
+  }),
+);
+
+app.use(
+  createReportActionsRouter({
+    authMiddleware,
+    supabaseAdmin,
+    getStepper: () => stepper,
+    reportService,
+  }),
+);
+
+app.use(
+  createReportWebhooksRouter({
+    supabaseAdmin,
+    reportService,
+  }),
+);
 
 // Rate limiting helper for token bucket (per share)
 const rateLimitBuckets = new Map(); // shareId -> { tokens, lastRefill }
@@ -519,6 +519,7 @@ app.post("/v1/ingest/commits", authMiddleware, async (req, res) => {
               commitId: insertedCommit.id,
               userId,
               jobId: result.jobId,
+              repoId,
             });
             return {
               sha: insertedCommit.sha,
@@ -1172,611 +1173,6 @@ app.get("/v1/settings/webhooks/logs", authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== COMMIT REPORTS ENDPOINTS ====================
-
-// Toggle auto-report generation for a repository
-// When enabling: triggers backfill of 5 most recent unreported commits
-// Reports are only fully enabled after all 5 backfill reports complete successfully
-app.put(
-  "/v1/repos/:repoId/reports/toggle",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const { repoId } = req.params;
-      const { enabled } = req.body;
-      const userId = req.userId;
-
-      if (typeof enabled !== "boolean") {
-        return res.status(400).json({ error: "enabled must be a boolean" });
-      }
-
-      const parsedRepoId = parseInt(repoId);
-
-      if (!enabled) {
-        // Disabling - straightforward
-        const result = await reportService.toggleReports(
-          supabaseAdmin,
-          parsedRepoId,
-          userId,
-          false,
-        );
-
-        if (!result.success) {
-          return res.status(400).json({ error: result.error });
-        }
-
-        return res.json({
-          message: "Reports disabled",
-          enabled: false,
-        });
-      }
-
-      // Enabling - trigger backfill of 5 most recent unreported commits
-      // Check for existing active backfill
-      const activeBackfill = await reportService.hasActiveBackfill(
-        supabaseAdmin,
-        parsedRepoId,
-        userId,
-      );
-
-      if (activeBackfill) {
-        return res.status(409).json({
-          error: "A backfill is already in progress for this repository",
-          status: "processing",
-        });
-      }
-
-      // Get 5 most recent commits without reports
-      const unreportedCommits =
-        await reportService.getRecentCommitsWithoutReports(
-          supabaseAdmin,
-          parsedRepoId,
-          userId,
-          reportService.AUTO_REPORT_LIMIT,
-        );
-
-      if (unreportedCommits.length === 0) {
-        // All recent commits already have reports - just enable
-        const result = await reportService.toggleReports(
-          supabaseAdmin,
-          parsedRepoId,
-          userId,
-          true,
-        );
-
-        if (!result.success) {
-          return res.status(400).json({ error: result.error });
-        }
-
-        return res.json({
-          message: "Reports enabled (all recent commits already have reports)",
-          enabled: true,
-          backfill: null,
-        });
-      }
-
-      // Don't enable reports yet - wait for backfill to complete
-      // Create backfill job to track progress
-      const backfillResult = await reportService.createBackfillJob(
-        supabaseAdmin,
-        parsedRepoId,
-        userId,
-        unreportedCommits,
-      );
-
-      if (!backfillResult.success) {
-        return res.status(500).json({ error: backfillResult.error });
-      }
-
-      // Check if stepper is available
-      if (!stepper) {
-        return res.status(503).json({
-          error: "Report generation service not available",
-        });
-      }
-
-      // Enqueue report generation for each commit
-
-      for (const commit of unreportedCommits) {
-        try {
-          const promptInput = {
-            userId,
-            commitSha: commit.sha,
-            repo: commit.repos?.name || "unknown",
-            message: commit.message || "",
-            files: (commit.files || []).map((f) => f.path || f),
-            components: commit.components || [],
-            diffSummary: commit.diff_summary || "",
-          };
-
-          const result = await stepper.enqueueReport(promptInput);
-
-          if (result.status === 202 && result.jobId) {
-            // Job enqueued - create tracking entry
-            await reportService.createReportJob(supabaseAdmin, {
-              commitId: commit.id,
-              userId,
-              jobId: result.jobId,
-            });
-
-            await reportService.updateBackfillCommitStatus(
-              supabaseAdmin,
-              backfillResult.backfillId,
-              commit.id,
-              "processing",
-              result.jobId,
-            );
-          } else if (result.status === 200 && result.cached) {
-            // Cached hit - save directly
-            await reportService.saveCachedReport(
-              supabaseAdmin,
-              commit.id,
-              userId,
-              result.data,
-              { provider: "cached", generationType: "backfill" },
-            );
-
-            await reportService.updateBackfillCommitStatus(
-              supabaseAdmin,
-              backfillResult.backfillId,
-              commit.id,
-              "completed",
-            );
-          }
-        } catch (err) {
-          await reportService.updateBackfillCommitStatus(
-            supabaseAdmin,
-            backfillResult.backfillId,
-            commit.id,
-            "failed",
-            null,
-            err.message,
-          );
-        }
-      }
-
-      // Get updated backfill status
-      const backfillStatus = await reportService.getBackfillStatus(
-        supabaseAdmin,
-        parsedRepoId,
-        userId,
-      );
-
-      res.status(202).json({
-        message: "Backfill started. Reports will be enabled once all complete.",
-        enabled: false, // Not enabled yet - waiting for backfill
-        backfill: {
-          id: backfillResult.backfillId,
-          status: backfillStatus?.status || "processing",
-          totalCommits: unreportedCommits.length,
-          completedCommits: backfillStatus?.completed_commits || 0,
-          failedCommits: backfillStatus?.failed_commits || 0,
-          commitDetails: backfillStatus?.commit_details || [],
-        },
-      });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to toggle reports" });
-    }
-  },
-);
-
-// Get backfill status for a repository
-app.get(
-  "/v1/repos/:repoId/reports/backfill",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const { repoId } = req.params;
-      const userId = req.userId;
-
-      const backfill = await reportService.getBackfillStatus(
-        supabaseAdmin,
-        parseInt(repoId),
-        userId,
-      );
-
-      if (!backfill) {
-        return res.json({ backfill: null });
-      }
-
-      res.json({
-        backfill: {
-          id: backfill.id,
-          status: backfill.status,
-          totalCommits: backfill.total_commits,
-          completedCommits: backfill.completed_commits,
-          failedCommits: backfill.failed_commits,
-          commitDetails: backfill.commit_details,
-          errorMessage: backfill.error_message,
-          createdAt: backfill.created_at,
-          updatedAt: backfill.updated_at,
-        },
-      });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch backfill status" });
-    }
-  },
-);
-
-// Retry failed backfill commits
-app.post(
-  "/v1/repos/:repoId/reports/backfill/retry",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const { repoId } = req.params;
-      const userId = req.userId;
-      const parsedRepoId = parseInt(repoId);
-
-      // Reset failed commits in backfill
-      const resetResult = await reportService.resetBackfillForRetry(
-        supabaseAdmin,
-        parsedRepoId,
-        userId,
-      );
-
-      if (!resetResult.success) {
-        return res.status(400).json({ error: resetResult.error });
-      }
-
-      const backfill = resetResult.backfill;
-      const pendingCommits = backfill.commit_details.filter(
-        (d) => d.status === "pending",
-      );
-
-      if (!stepper) {
-        return res.status(503).json({
-          error: "Report generation service not available",
-        });
-      }
-
-      // Re-enqueue the failed (now pending) commits
-      for (const detail of pendingCommits) {
-        try {
-          const commit = await reportService.getCommitForReport(
-            supabaseAdmin,
-            detail.commitId,
-            userId,
-          );
-
-          if (!commit) {
-            await reportService.updateBackfillCommitStatus(
-              supabaseAdmin,
-              backfill.id,
-              detail.commitId,
-              "failed",
-              null,
-              "Commit not found",
-            );
-            continue;
-          }
-
-          const promptInput = {
-            userId,
-            commitSha: commit.sha,
-            repo: commit.repos?.name || "unknown",
-            message: commit.message || "",
-            files: (commit.files || []).map((f) => f.path || f),
-            components: commit.components || [],
-            diffSummary: commit.diff_summary || "",
-          };
-
-          const result = await stepper.enqueueReport(promptInput);
-
-          if (result.status === 202 && result.jobId) {
-            await reportService.createReportJob(supabaseAdmin, {
-              commitId: detail.commitId,
-              userId,
-              jobId: result.jobId,
-            });
-
-            await reportService.updateBackfillCommitStatus(
-              supabaseAdmin,
-              backfill.id,
-              detail.commitId,
-              "processing",
-              result.jobId,
-            );
-          } else if (result.status === 200 && result.cached) {
-            await reportService.saveCachedReport(
-              supabaseAdmin,
-              detail.commitId,
-              userId,
-              result.data,
-              { provider: "cached", generationType: "backfill" },
-            );
-
-            await reportService.updateBackfillCommitStatus(
-              supabaseAdmin,
-              backfill.id,
-              detail.commitId,
-              "completed",
-            );
-          }
-        } catch (err) {
-          await reportService.updateBackfillCommitStatus(
-            supabaseAdmin,
-            backfill.id,
-            detail.commitId,
-            "failed",
-            null,
-            err.message,
-          );
-        }
-      }
-
-      const updatedStatus = await reportService.getBackfillStatus(
-        supabaseAdmin,
-        parsedRepoId,
-        userId,
-      );
-
-      res.json({
-        message: `Retrying ${pendingCommits.length} failed reports`,
-        backfill: {
-          id: backfill.id,
-          status: updatedStatus?.status || "processing",
-          totalCommits: updatedStatus?.total_commits || backfill.total_commits,
-          completedCommits: updatedStatus?.completed_commits || 0,
-          failedCommits: updatedStatus?.failed_commits || 0,
-          commitDetails: updatedStatus?.commit_details || [],
-        },
-      });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to retry backfill" });
-    }
-  },
-);
-
-// Get report for a specific commit
-app.get("/v1/commits/:commitId/report", authMiddleware, async (req, res) => {
-  try {
-    const { commitId } = req.params;
-    const userId = req.userId;
-
-    // First check if report exists
-    const report = await reportService.getReport(
-      supabaseAdmin,
-      parseInt(commitId),
-      userId,
-    );
-
-    if (report) {
-      return res.json({
-        status: "completed",
-        report,
-      });
-    }
-
-    // Check if there's a pending job
-    const job = await reportService.getJobStatus(
-      supabaseAdmin,
-      parseInt(commitId),
-      userId,
-    );
-
-    if (job) {
-      return res.json({
-        status: job.status,
-        jobId: job.job_id,
-        attempts: job.attempts,
-        createdAt: job.created_at,
-      });
-    }
-
-    // No report and no job
-    res.json({ status: "not_found" });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch report" });
-  }
-});
-
-// Trigger report generation for a commit
-app.post("/v1/commits/:commitId/report", authMiddleware, async (req, res) => {
-  try {
-    const { commitId } = req.params;
-    const userId = req.userId;
-
-    // Check if report already exists
-    const existingReport = await reportService.getReport(
-      supabaseAdmin,
-      parseInt(commitId),
-      userId,
-    );
-
-    if (existingReport) {
-      return res.json({
-        status: "completed",
-        message: "Report already exists",
-        report: existingReport,
-      });
-    }
-
-    // Check if there's already a pending job
-    const existingJob = await reportService.getJobStatus(
-      supabaseAdmin,
-      parseInt(commitId),
-      userId,
-    );
-
-    if (existingJob && existingJob.status === "pending") {
-      return res.status(202).json({
-        status: "processing",
-        message: "Report generation already in progress",
-        jobId: existingJob.job_id,
-      });
-    }
-
-    // Get commit data for report generation
-    const commit = await reportService.getCommitForReport(
-      supabaseAdmin,
-      parseInt(commitId),
-      userId,
-    );
-
-    if (!commit) {
-      return res.status(404).json({ error: "Commit not found" });
-    }
-
-    // Check if stepper is available
-    if (!stepper) {
-      return res.status(503).json({
-        error: "Report generation service not available",
-      });
-    }
-
-    // Trigger report generation via Stepper
-    const promptInput = {
-      userId,
-      commitSha: commit.sha,
-      repo: commit.repos?.name || "unknown",
-      message: commit.message || "",
-      files: (commit.files || []).map((f) => f.path || f),
-      components: commit.components || [],
-      diffSummary: commit.diff_summary || "",
-    };
-
-    const result = await stepper.enqueueReport(promptInput);
-
-    if (result.status === 200 && result.cached) {
-      // Immediate cache hit - save directly without job tracking
-      await reportService.saveCachedReport(
-        supabaseAdmin,
-        parseInt(commitId),
-        userId,
-        result.data,
-        { provider: "cached", generationType: "manual" },
-      );
-
-      return res.json({
-        status: "completed",
-        message: "Report generated from cache",
-        report: result.data,
-      });
-    }
-
-    // Job enqueued - create tracking entry
-    if (!result.jobId) {
-      return res.status(500).json({
-        error: "Stepper did not return a job ID",
-        debug: result,
-      });
-    }
-
-    const jobResult = await reportService.createReportJob(supabaseAdmin, {
-      commitId: parseInt(commitId),
-      userId,
-      jobId: result.jobId,
-    });
-
-    if (!jobResult.success) {
-      return res.status(500).json({ error: jobResult.error });
-    }
-
-    res.status(202).json({
-      status: "processing",
-      message: "Report generation started",
-      jobId: result.jobId,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to trigger report generation" });
-  }
-});
-
-// Get job status by ID
-app.get("/v1/jobs/:jobId", authMiddleware, async (req, res) => {
-  try {
-    const { jobId } = req.params;
-
-    // Get job from database
-    const { data: job, error } = await supabaseAdmin
-      .from("report_jobs")
-      .select("*")
-      .eq("job_id", jobId)
-      .single();
-
-    if (error || !job) {
-      // Job might be completed - check if report exists
-      return res.json({
-        status: "not_found",
-        message:
-          "Job not found. It may have completed - check the commit report.",
-      });
-    }
-
-    // Optionally check stepper for real-time status
-    let stepperStatus = null;
-    if (stepper) {
-      try {
-        stepperStatus = await stepper.getJob(jobId);
-      } catch (e) {
-        // Stepper unavailable, use DB status
-      }
-    }
-
-    res.json({
-      status: job.status,
-      jobId: job.job_id,
-      commitId: job.commit_id,
-      attempts: job.attempts,
-      createdAt: job.created_at,
-      lastPolledAt: job.last_polled_at,
-      nextPollAt: job.next_poll_at,
-      errorMessage: job.error_message,
-      stepperState: stepperStatus?.state || null,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch job status" });
-  }
-});
-
-// Get all repos with their report settings
-app.get("/v1/repos/reports", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.userId;
-
-    const { data: repos, error } = await supabaseAdmin
-      .from("repos")
-      .select("id, name, remote, enable_reports, updated_at")
-      .eq("user_id", userId)
-      .order("name");
-
-    if (error) {
-      return res.status(500).json({ error: "Failed to fetch repos" });
-    }
-
-    // Fetch backfill status for all repos
-    const { data: backfills } = await supabaseAdmin
-      .from("backfill_jobs")
-      .select(
-        "repo_id, status, total_commits, completed_commits, failed_commits, commit_details, created_at, updated_at",
-      )
-      .eq("user_id", userId);
-
-    const backfillMap = new Map();
-    (backfills || []).forEach((b) => {
-      backfillMap.set(b.repo_id, {
-        status: b.status,
-        totalCommits: b.total_commits,
-        completedCommits: b.completed_commits,
-        failedCommits: b.failed_commits,
-        commitDetails: b.commit_details,
-        createdAt: b.created_at,
-        updatedAt: b.updated_at,
-      });
-    });
-
-    const reposWithBackfill = (repos || []).map((repo) => ({
-      ...repo,
-      backfill: backfillMap.get(repo.id) || null,
-    }));
-
-    res.json({ repos: reposWithBackfill });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch repos" });
-  }
-});
-
 // ==================== SHARES ENDPOINTS ====================
 
 // Helper function to build snapshot from commits
@@ -2299,695 +1695,16 @@ app.get("/v1/shares/:shareId/export", authMiddleware, async (req, res) => {
 /**
  * Validate webhook signature using both Bearer token and HMAC-SHA256
  */
-function validateWebhookSignature(req) {
-  const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-
-  if (!WEBHOOK_SECRET) {
-    return false;
-  }
-
-  // Check Bearer token
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return false;
-  }
-
-  const bearerToken = authHeader.substring(7);
-  if (bearerToken !== WEBHOOK_SECRET) {
-    return false;
-  }
-
-  // Check HMAC signature
-  const signature = req.headers["x-webhook-signature"];
-  const timestamp = req.headers["x-webhook-timestamp"];
-
-  if (!signature || !timestamp) {
-    return false;
-  }
-
-  // Verify timestamp is recent (within 5 minutes) to prevent replay attacks
-  const now = Date.now();
-  const requestTime = parseInt(timestamp, 10);
-  if (Math.abs(now - requestTime) > 5 * 60 * 1000) {
-    return false;
-  }
-
-  // Calculate expected signature
-  const payloadString = JSON.stringify(req.body);
-  const expectedSignature = crypto
-    .createHmac("sha256", WEBHOOK_SECRET)
-    .update(payloadString)
-    .digest("hex");
-
-  if (signature !== expectedSignature) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Stepper Callback Endpoint
- * Called by Stepper immediately after report generation (before DB save)
- * This ensures users get Discord notifications even if DB fails
- *
- * Flow:
- * 1. Receive callback from Stepper with raw result
- * 2. Send to user's Discord FIRST (critical path)
- * 3. Return success (DB operations handled by legacy webhook)
- */
-app.post("/v1/stepper/callback", express.json(), async (req, res) => {
-  try {
-    const { success, result, error, metadata } = req.body;
-    const {
-      userId,
-      commitSha,
-      repo,
-      jobId,
-      provider,
-      generationTimeMs,
-      timestamp,
-    } = metadata || {};
-
-    if (!userId) {
-      return res
-        .status(200)
-        .json({ success: true, message: "No userId, skipped" });
-    }
-
-    // Fetch user's webhook settings
-    let webhookSettings = null;
-    try {
-      const { data: settings } = await supabaseAdmin
-        .from("user_webhook_settings")
-        .select("*")
-        .eq("user_id", userId)
-        .eq("enabled", true)
-        .single();
-      webhookSettings = settings;
-    } catch (dbError) {
-      // DB might be down - this is exactly why we get callbacks directly from Stepper
-      // We'll try again with cached settings if available, or skip
-    }
-
-    if (!webhookSettings) {
-      return res
-        .status(200)
-        .json({ success: true, message: "No webhook configured" });
-    }
-
-    const events = webhookSettings.events || [];
-    const webhookUrl = webhookSettings.discord_webhook_url;
-    const webhookSecret = webhookSettings.webhook_secret;
-
-    if (!webhookUrl) {
-      return res.status(200).json({ success: true, message: "No webhook URL" });
-    }
-
-    // Handle success case
-    if (success && result) {
-      if (!events.includes("report_completed")) {
-        return res
-          .status(200)
-          .json({ success: true, message: "Event not subscribed" });
-      }
-
-      // Transform result to Discord embed format
-      const payload = {
-        embeds: [
-          {
-            title: `✅ ${result.title || "Commit Report Generated"}`,
-            description: (
-              result.summary || "Report generated successfully"
-            ).substring(0, 2048),
-            color: 0x00ff00, // Green
-            fields: [
-              {
-                name: "📝 Commit",
-                value: `\`${commitSha?.substring(0, 7) || "Unknown"}\``,
-                inline: true,
-              },
-              {
-                name: "📦 Repository",
-                value: repo || "Unknown",
-                inline: true,
-              },
-              ...(result.category
-                ? [
-                    {
-                      name: "🏷️ Category",
-                      value: result.category,
-                      inline: true,
-                    },
-                  ]
-                : []),
-              ...(result.tags
-                ? [
-                    {
-                      name: "🔖 Tags",
-                      value: result.tags,
-                      inline: true,
-                    },
-                  ]
-                : []),
-              ...(provider
-                ? [
-                    {
-                      name: "🤖 Generated By",
-                      value: provider,
-                      inline: true,
-                    },
-                  ]
-                : []),
-              ...(result.changes &&
-              Array.isArray(result.changes) &&
-              result.changes.length > 0
-                ? [
-                    {
-                      name: "📋 Key Changes",
-                      value: result.changes
-                        .slice(0, 5)
-                        .map((c) => `• ${c}`)
-                        .join("\n")
-                        .substring(0, 1024),
-                      inline: false,
-                    },
-                  ]
-                : []),
-              ...(result.rationale
-                ? [
-                    {
-                      name: "💡 Rationale",
-                      value: result.rationale.substring(0, 1024),
-                      inline: false,
-                    },
-                  ]
-                : []),
-              ...(result.next_steps &&
-              Array.isArray(result.next_steps) &&
-              result.next_steps.length > 0
-                ? [
-                    {
-                      name: "⏭️ Next Steps",
-                      value: result.next_steps
-                        .slice(0, 3)
-                        .map((s, i) => `${i + 1}. ${s}`)
-                        .join("\n")
-                        .substring(0, 1024),
-                      inline: false,
-                    },
-                  ]
-                : []),
-            ],
-            footer: {
-              text: `CommitDiary • Generated in ${generationTimeMs || 0}ms`,
-            },
-            timestamp: timestamp || new Date().toISOString(),
-          },
-        ],
-      };
-
-      // Send to Discord IMMEDIATELY - this is the critical path
-      const discordResult = await discordAlerts.sendDiscordWebhook({
-        webhookUrl,
-        payload,
-        secret: webhookSecret,
-        maxRetries: 3,
-      });
-
-      // Log delivery (best effort - don't fail if DB is down)
-      try {
-        await supabaseAdmin.from("user_webhook_delivery_log").insert({
-          user_id: userId,
-          webhook_settings_id: webhookSettings.id,
-          event_type: "report_completed",
-          payload,
-          status_code: discordResult.statusCode,
-          success: discordResult.success,
-          error_message: discordResult.error || null,
-          attempt: discordResult.attempt,
-        });
-
-        // Update stats
-        await supabaseAdmin
-          .from("user_webhook_settings")
-          .update({
-            last_delivery_at: new Date().toISOString(),
-            ...(discordResult.success
-              ? {
-                  last_success_at: new Date().toISOString(),
-                  failure_count: 0,
-                }
-              : {
-                  last_failure_at: new Date().toISOString(),
-                }),
-            total_deliveries: webhookSettings.total_deliveries + 1,
-          })
-          .eq("id", webhookSettings.id);
-      } catch (logError) {}
-      return res.status(200).json({
-        success: true,
-        discordDelivered: discordResult.success,
-        message: discordResult.success
-          ? "Sent to Discord"
-          : "Discord delivery failed",
-      });
-    }
-
-    // Handle failure case
-    if (!success && error) {
-      if (!events.includes("report_failed")) {
-        return res
-          .status(200)
-          .json({ success: true, message: "Event not subscribed" });
-      }
-
-      const payload = {
-        embeds: [
-          {
-            title: "❌ Report Generation Failed",
-            description: `Failed to generate commit report for \`${commitSha?.substring(0, 7) || "Unknown"}\``,
-            color: 0xff0000, // Red
-            fields: [
-              {
-                name: "📦 Repository",
-                value: repo || "Unknown",
-                inline: true,
-              },
-              {
-                name: "❗ Error",
-                value: (error || "Unknown error").substring(0, 1024),
-                inline: false,
-              },
-            ],
-            timestamp: timestamp || new Date().toISOString(),
-          },
-        ],
-      };
-
-      const discordResult = await discordAlerts.sendDiscordWebhook({
-        webhookUrl,
-        payload,
-        secret: webhookSecret,
-        maxRetries: 2,
-      });
-
-      return res.status(200).json({
-        success: true,
-        discordDelivered: discordResult.success,
-      });
-    }
-
-    return res.status(200).json({ success: true, message: "Processed" });
-  } catch (error) {
-    // Always return 200 to avoid Stepper retries for our errors
-    return res.status(200).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * Webhook endpoint for report completion
- * Called by Stepper when a report job completes
- * Enhanced with retry logic and atomic operations
- */
-app.post("/v1/webhooks/report-completed", express.json(), async (req, res) => {
-  const maxRetries = 3;
-  let attempt = 0;
-  
-  const processWebhook = async () => {
-    try {
-      console.log('🔔 Webhook received:', {
-        headers: {
-          'authorization': req.headers.authorization ? '[REDACTED]' : undefined,
-          'x-webhook-signature': req.headers['x-webhook-signature'] ? '[PRESENT]' : undefined,
-          'x-webhook-timestamp': req.headers['x-webhook-timestamp'],
-          'content-type': req.headers['content-type'],
-        },
-        body: req.body,
-        hasWebhookSecret: !!process.env.WEBHOOK_SECRET,
-        webhookSecretLength: process.env.WEBHOOK_SECRET?.length,
-        timestamp: new Date().toISOString(),
-        attempt: attempt + 1
-      });
-
-      // Validate webhook signature
-      if (!validateWebhookSignature(req)) {
-        console.error('❌ Webhook signature validation failed', {
-          hasSecret: !!process.env.WEBHOOK_SECRET,
-          hasAuthHeader: !!req.headers.authorization,
-          hasSignature: !!req.headers['x-webhook-signature'],
-          hasTimestamp: !!req.headers['x-webhook-timestamp']
-        });
-        throw new Error("Invalid webhook signature");
-      }
-
-      const { jobId, status, result, error, timestamp } = req.body;
-
-      if (!jobId) {
-        console.error('❌ Missing jobId in webhook payload');
-        throw new Error("Missing jobId");
-      }
-
-      console.log(`✅ Webhook validated for job ${jobId}, status: ${status}`);
-
-      if (status === "completed" && result) {
-        // Report generation succeeded
-        console.log(`📝 Processing completed job ${jobId}`);
-        
-        // Get job info to find commit_id for backfill tracking
-        const { data: jobInfo, error: jobError } = await supabaseAdmin
-          .from("report_jobs")
-          .select("commit_id, user_id")
-          .eq("job_id", jobId)
-          .single();
-
-        if (jobError) {
-          console.error(`❌ Failed to find job info for ${jobId}:`, jobError);
-          throw new Error(`Job lookup failed: ${jobError.message}`);
-        }
-
-        console.log(`📋 Found job info: commit_id=${jobInfo.commit_id}, user_id=${jobInfo.user_id}`);
-
-        // Save to database - this is the critical operation
-        const saveResult = await reportService.completeJob(supabaseAdmin, jobId, result, {
-          generationType: "auto", // Default for webhook-delivered reports
-        });
-
-        if (!saveResult.success) {
-          console.error(`❌ Database save failed for job ${jobId}:`, saveResult.error);
-          throw new Error(`Database save failed: ${saveResult.error}`);
-        }
-
-        console.log(`✅ Report saved to database for job ${jobId}`);
-
-        // Send Discord notification ONLY after successful DB save
-        try {
-          await sendDiscordNotification(jobInfo.user_id, result, {
-            commitSha: req.body.metadata?.commitSha,
-            repo: req.body.metadata?.repo,
-            success: true,
-            jobId: jobId
-          });
-          console.log(`📤 Discord notification sent for job ${jobId}`);
-        } catch (discordError) {
-          console.error(`⚠️ Discord notification failed for job ${jobId}:`, discordError);
-          // Don't fail the operation, but log the error
-        }
-
-        // Check if this commit is part of a backfill and update status
-        if (jobInfo) {
-          const { data: backfill, error: backfillError } = await supabaseAdmin
-            .from("backfill_jobs")
-            .select("id, commit_details, repo_id")
-            .eq("user_id", jobInfo.user_id)
-            .eq("status", "processing")
-            .single();
-
-          if (backfill) {
-            const isBackfillCommit = (backfill.commit_details || []).some(
-              (d) => d.commitId === jobInfo.commit_id,
-            );
-            if (isBackfillCommit) {
-              console.log(`🔄 Updating backfill commit status for commit ${jobInfo.commit_id} in backfill ${backfill.id}`);
-              await reportService.updateBackfillCommitStatus(
-                supabaseAdmin,
-                backfill.id,
-                jobInfo.commit_id,
-                "completed",
-                jobId,
-              );
-              console.log(`✅ Backfill commit status updated`);
-            } else {
-              console.log(`ℹ️ Commit ${jobInfo.commit_id} is not part of active backfill`);
-            }
-          } else if (backfillError) {
-            console.error(`❌ Failed to find backfill for user ${jobInfo.user_id}:`, backfillError);
-          } else {
-            console.log(`ℹ️ No active backfill found for user ${jobInfo.user_id}`);
-          }
-        } else {
-          console.log(`ℹ️ No job info available for backfill tracking`);
-        }
-        
-        console.log(`✅ Webhook processed successfully for completed job ${jobId}`);
-        return { success: true, message: "Report saved and notifications sent" };
-      } 
-      
-      if (status === "failed" && error) {
-        // Report generation failed
-        console.log(`❌ Processing failed job ${jobId}:`, error);
-        
-        // Get job info to find commit_id for backfill tracking
-        const { data: jobInfo } = await supabaseAdmin
-          .from("report_jobs")
-          .select("commit_id, user_id")
-          .eq("job_id", jobId)
-          .single();
-
-        if (jobInfo) {
-          // Send failure Discord notification
-          try {
-            await sendDiscordNotification(jobInfo.user_id, null, {
-              commitSha: req.body.metadata?.commitSha,
-              repo: req.body.metadata?.repo,
-              success: false,
-              error: error,
-              jobId: jobId
-            });
-            console.log(`📤 Discord failure notification sent for job ${jobId}`);
-          } catch (discordError) {
-            console.error(`⚠️ Discord failure notification failed for job ${jobId}:`, discordError);
-          }
-
-          const { data: backfill } = await supabaseAdmin
-            .from("backfill_jobs")
-            .select("id, commit_details")
-            .eq("user_id", jobInfo.user_id)
-            .in("status", ["processing"])
-            .single();
-
-          if (backfill) {
-            const isBackfillCommit = (backfill.commit_details || []).some(
-              (d) => d.commitId === jobInfo.commit_id,
-            );
-            if (isBackfillCommit) {
-              console.log(`🔄 Updating backfill commit status to FAILED for commit ${jobInfo.commit_id} in backfill ${backfill.id}`);
-              await reportService.updateBackfillCommitStatus(
-                supabaseAdmin,
-                backfill.id,
-                jobInfo.commit_id,
-                "failed",
-                jobId,
-                error,
-              );
-              console.log(`✅ Backfill commit failure status updated`);
-            }
-          }
-        }
-        
-        // Mark job as failed in database
-        await reportService.markJobFailed(supabaseAdmin, jobId, error);
-        
-        console.log(`✅ Webhook processed successfully for failed job ${jobId}`);
-        return { success: true, message: "Failure recorded and notifications sent" };
-      }
-      
-      throw new Error(`Invalid webhook payload status: ${status}`);
-      
-    } catch (error) {
-      attempt++;
-      console.error(`Webhook processing attempt ${attempt} failed:`, {
-        error: error.message,
-        jobId: req.body.jobId,
-        timestamp: new Date().toISOString()
-      });
-      
-      if (attempt < maxRetries) {
-        // Exponential backoff: 1s, 2s, 4s
-        const delayMs = Math.pow(2, attempt - 1) * 1000;
-        console.log(`🔄 Retrying webhook processing in ${delayMs}ms (attempt ${attempt}/${maxRetries})`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-        return processWebhook();
-      }
-      
-      console.error(`❌ Webhook processing failed after ${maxRetries} attempts:`, error.message);
-      throw error;
-    }
-  };
-  
-  try {
-    const result = await processWebhook();
-    res.status(200).json(result);
-  } catch (error) {
-    console.error(`❌ Final webhook processing failed:`, {
-      error: error.message,
-      stack: error.stack,
-      timestamp: new Date().toISOString()
-    });
-    res.status(500).json({ error: "Webhook processing failed", message: error.message });
-  }
-});
-
-/**
- * Send Discord notification for report completion/failure
- * Centralized function for Discord delivery
- */
-async function sendDiscordNotification(userId, result, options) {
-  try {
-    // Fetch user's webhook settings
-    const { data: webhookSettings } = await supabaseAdmin
-      .from("user_webhook_settings")
-      .select("*")
-      .eq("user_id", userId)
-      .eq("enabled", true)
-      .single();
-
-    if (!webhookSettings) {
-      console.log(`ℹ️ No webhook settings configured for user ${userId}`);
-      return { success: false, message: "No webhook configured" };
-    }
-
-    const events = webhookSettings.events || [];
-    const webhookUrl = webhookSettings.discord_webhook_url;
-    const webhookSecret = webhookSettings.webhook_secret;
-
-    if (!webhookUrl) {
-      return { success: false, message: "No webhook URL" };
-    }
-
-    // Handle success case
-    if (options.success && result) {
-      if (!events.includes("report_completed")) {
-        return { success: false, message: "Event not subscribed" };
-      }
-
-      const payload = {
-        embeds: [
-          {
-            title: `✅ ${result.title || "Commit Report Generated"}`,
-            description: (
-              result.summary || "Report generated successfully"
-            ).substring(0, 2048),
-            color: 0x00ff00, // Green
-            fields: [
-              {
-                name: "📝 Commit",
-                value: `\`${options.commitSha?.substring(0, 7) || "Unknown"}\``,
-                inline: true,
-              },
-              {
-                name: "📦 Repository",
-                value: options.repo || "Unknown",
-                inline: true,
-              },
-              ...(result.category
-                ? [
-                    {
-                      name: "🏷️ Category",
-                      value: result.category,
-                      inline: true,
-                    },
-                  ]
-                : []),
-              ...(result.tags
-                ? [
-                    {
-                      name: "🔖 Tags",
-                      value: result.tags,
-                      inline: true,
-                    },
-                  ]
-                : []),
-              ...(result.changes &&
-              Array.isArray(result.changes) &&
-              result.changes.length > 0
-                ? [
-                    {
-                      name: "📋 Key Changes",
-                      value: result.changes
-                        .slice(0, 5)
-                        .map((c) => `• ${c}`)
-                        .join("\n")
-                        .substring(0, 1024),
-                      inline: false,
-                    },
-                  ]
-                : []),
-            ],
-            footer: {
-              text: `CommitDiary • Job ID: ${options.jobId}`,
-            },
-            timestamp: new Date().toISOString(),
-          },
-        ],
-      };
-
-      const discordResult = await discordAlerts.sendDiscordWebhook({
-        webhookUrl,
-        payload,
-        secret: webhookSecret,
-        maxRetries: 3,
-      });
-
-      return { success: discordResult.success, statusCode: discordResult.statusCode };
-    }
-
-    // Handle failure case
-    if (!options.success && options.error) {
-      if (!events.includes("report_failed")) {
-        return { success: false, message: "Event not subscribed" };
-      }
-
-      const payload = {
-        embeds: [
-          {
-            title: "❌ Report Generation Failed",
-            description: `Failed to generate commit report for \`${options.commitSha?.substring(0, 7) || "Unknown"}\``,
-            color: 0xff0000, // Red
-            fields: [
-              {
-                name: "📦 Repository",
-                value: options.repo || "Unknown",
-                inline: true,
-              },
-              {
-                name: "❗ Error",
-                value: (options.error || "Unknown error").substring(0, 1024),
-                inline: false,
-              },
-              {
-                name: "🆔 Job ID",
-                value: options.jobId || "Unknown",
-                inline: true,
-              },
-            ],
-            timestamp: new Date().toISOString(),
-          },
-        ],
-      };
-
-      const discordResult = await discordAlerts.sendDiscordWebhook({
-        webhookUrl,
-        payload,
-        secret: webhookSecret,
-        maxRetries: 2,
-      });
-
-      return { success: discordResult.success, statusCode: discordResult.statusCode };
-    }
-
-    return { success: false, message: "Invalid notification options" };
-  } catch (error) {
-    console.error(`❌ Discord notification failed:`, error);
-    return { success: false, error: error.message };
-  }
-}
 
 /**
  * Debug endpoint to test webhook functionality
  * This helps diagnose webhook issues without waiting for real report generation
  */
-app.post("/v1/debug/test-webhook", express.json(), async (req, res) => {
+app.post(
+  "/v1/debug/test-webhook",
+  debugRouteMiddleware,
+  express.json(),
+  async (req, res) => {
   try {
     console.log('🧪 Debug webhook test called');
     
@@ -3017,8 +1734,9 @@ app.post("/v1/debug/test-webhook", express.json(), async (req, res) => {
       if (commitId) {
         const { data } = await supabaseAdmin
           .from("report_jobs")
-          .select("commit_id, user_id")
+          .select("commit_id, user_id, repo_id, backfill_id")
           .eq("commit_id", commitId)
+          .eq("user_id", req.userId)
           .single();
         jobInfo = data;
       }
@@ -3027,12 +1745,14 @@ app.post("/v1/debug/test-webhook", express.json(), async (req, res) => {
         console.log(`🧪 Found job info: commit_id=${jobInfo.commit_id}, user_id=${jobInfo.user_id}`);
         
         // Check for backfill
-        const { data: backfill } = await supabaseAdmin
-          .from("backfill_jobs")
-          .select("id, commit_details, repo_id")
-          .eq("user_id", jobInfo.user_id)
-          .eq("status", "processing")
-          .single();
+        const backfill = await reportService.findActiveBackfillForCommit(
+          supabaseAdmin,
+          {
+            userId: jobInfo.user_id,
+            commitId: jobInfo.commit_id,
+            repoId: jobInfo.repo_id || null,
+          },
+        );
 
         if (backfill) {
           const isBackfillCommit = (backfill.commit_details || []).some(
@@ -3063,7 +1783,8 @@ app.post("/v1/debug/test-webhook", express.json(), async (req, res) => {
     console.error(`🧪 Debug webhook error:`, error);
     return res.status(500).json({ error: "Debug webhook failed" });
   }
-});
+  },
+);
 
 // Get pending jobs count for a repository
 app.get("/v1/repos/:repoId/jobs/pending", authMiddleware, async (req, res) => {
@@ -3111,31 +1832,8 @@ app.get("/v1/repos/:repoId/jobs/pending", authMiddleware, async (req, res) => {
   }
 });
 
-// Manual job recovery endpoint
-app.post("/v1/jobs/recover", authMiddleware, async (req, res) => {
-  try {
-    console.log(`🔄 Manual job recovery triggered by user ${req.userId}`);
-    const results = await reportService.recoverStuckJobs(supabaseAdmin, 4); // 4 hour cutoff for manual recovery
-    
-    console.log(`📊 Manual recovery results:`, results);
-    
-    res.json({ 
-      success: true, 
-      message: "Job recovery completed",
-      results: {
-        recovered: results.recovered,
-        failed: results.failed,
-        errors: results.errors
-      }
-    });
-  } catch (error) {
-    console.error('Manual job recovery failed:', error);
-    res.status(500).json({ error: "Job recovery failed", message: error.message });
-  }
-});
-
 // Debug endpoint to test stepper connection
-app.get("/v1/debug/stepper", async (req, res) => {
+app.get("/v1/debug/stepper", debugRouteMiddleware, async (req, res) => {
   try {
     if (!stepper) {
       return res.json({ error: "Stepper not initialized" });
@@ -3160,10 +1858,13 @@ app.get("/v1/debug/stepper", async (req, res) => {
 });
 
 // Manual backfill recovery endpoint
-app.post("/v1/debug/recover-backfill/:repoId", async (req, res) => {
+app.post(
+  "/v1/debug/recover-backfill/:repoId",
+  debugRouteMiddleware,
+  async (req, res) => {
   try {
     const { repoId } = req.params;
-    const userId = "test"; // Hardcoded for debugging
+    const userId = req.userId;
     
     if (!stepper) {
       return res.json({ error: "Stepper not initialized" });
@@ -3174,6 +1875,7 @@ app.post("/v1/debug/recover-backfill/:repoId", async (req, res) => {
       .from("backfill_jobs")
       .select("*")
       .eq("repo_id", repoId)
+      .eq("user_id", userId)
       .eq("status", "processing")
       .single();
     
@@ -3187,7 +1889,8 @@ app.post("/v1/debug/recover-backfill/:repoId", async (req, res) => {
     const commitIds = backfill.commit_details.map(d => d.commitId);
     const { data: commits } = await supabaseAdmin
       .from("commits")
-      .select("*")
+      .select("*, repos(name)")
+      .eq("user_id", userId)
       .in("id", commitIds);
     
     let processed = 0;
@@ -3226,6 +1929,8 @@ app.post("/v1/debug/recover-backfill/:repoId", async (req, res) => {
               commitId: commit.id,
               userId,
               jobId: result.jobId,
+              repoId: backfill.repo_id,
+              backfillId: backfill.id,
             });
             
             processed++;
@@ -3271,7 +1976,8 @@ app.post("/v1/debug/recover-backfill/:repoId", async (req, res) => {
     console.error('Backfill recovery failed:', error);
     res.status(500).json({ error: error.message });
   }
-});
+  },
+);
 
 // Get system health and job statistics
 app.get("/v1/system/health", authMiddleware, async (req, res) => {
@@ -3360,12 +2066,14 @@ process.on("uncaughtException", (error) => {
 });
 
 app.listen(port, () => {
-  // Initialize cron poller for async report jobs
+  // Initialize cron poller for async report jobs after stepper setup settles.
   if (supabaseAdmin) {
-    initCronPoller({
-      supabase: supabaseAdmin,
-      stepper: stepper,
-      intervalMs: 15 * 60 * 1000, // 15 minutes - recovery mode only (webhooks deliver instantly)
+    stepperInitPromise.finally(() => {
+      initCronPoller({
+        supabase: supabaseAdmin,
+        stepper: stepper,
+        intervalMs: 15 * 60 * 1000, // 15 minutes - recovery mode only (webhooks deliver instantly)
+      });
     });
   }
 });
