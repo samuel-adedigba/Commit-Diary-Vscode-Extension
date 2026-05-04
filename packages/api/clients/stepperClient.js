@@ -13,10 +13,16 @@ function normalizeEnqueueResult(raw, fallbackJobId = null) {
     return { status: 500, error: "Invalid Stepper response" };
   }
 
-  const status = typeof raw.status === "number" ? raw.status : null;
+  let status = null;
+  if (typeof raw.httpStatus === "number") {
+    status = raw.httpStatus;
+  } else if (typeof raw.status === "number") {
+    status = raw.status;
+  }
+  const bodyStatus = typeof raw.status === "string" ? raw.status : null;
   const jobId = raw.jobId || raw.id || fallbackJobId || null;
 
-  if (status === 202 || raw.accepted === true) {
+  if (status === 202 || raw.accepted === true || bodyStatus === "queued") {
     return {
       status: 202,
       jobId,
@@ -27,7 +33,7 @@ function normalizeEnqueueResult(raw, fallbackJobId = null) {
 
   const isCached = raw.cached === true || raw.cacheHit === true;
   const data = raw.data || raw.result || null;
-  if (status === 200 && isCached) {
+  if ((status === 200 || bodyStatus === "completed") && isCached) {
     return {
       status: 200,
       cached: true,
@@ -46,11 +52,28 @@ function normalizeEnqueueResult(raw, fallbackJobId = null) {
   }
 
   return {
+    ...raw,
     status: status || 500,
     jobId,
     ...(raw.error ? { error: raw.error } : {}),
     ...(raw.message ? { message: raw.message } : {}),
+  };
+}
+
+function normalizeJobResult(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const state = raw.state || raw.status || null;
+  const result = raw.result || raw.data || null;
+
+  return {
     ...raw,
+    state,
+    status: raw.status || state,
+    result,
+    failedReason: raw.failedReason || raw.error || null,
   };
 }
 
@@ -83,7 +106,7 @@ export async function createStepperClient(options = {}) {
           return normalizeEnqueueResult(raw, raw?.jobId || payload?.jobId || null);
         },
         getJob: async (jobId) => {
-          return await stepperModule.getJob(jobId);
+          return normalizeJobResult(await stepperModule.getJob(jobId));
         },
       };
     } catch (error) {
@@ -101,13 +124,17 @@ export async function createStepperClient(options = {}) {
         body: JSON.stringify(payload),
       });
       const data = await response.json();
-      return normalizeEnqueueResult({ status: response.status, ...data });
+      return normalizeEnqueueResult({ ...data, httpStatus: response.status });
     },
     getJob: async (jobId) => {
       const response = await fetch(`${stepperUrl}/v1/reports/${jobId}`, {
         headers: buildHeaders(apiKey, apiKeyHeader),
       });
-      return await response.json();
+      const data = await response.json();
+      if (!response.ok) {
+        return null;
+      }
+      return normalizeJobResult(data);
     },
   };
 }

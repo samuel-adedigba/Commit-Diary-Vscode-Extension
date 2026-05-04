@@ -397,6 +397,42 @@ export async function saveCachedReport(
   return { success: true };
 }
 
+export async function getReportJobByJobId(supabaseAdmin, jobId) {
+  const selectWithMetadata = await supabaseAdmin
+    .from("report_jobs")
+    .select("commit_id, user_id, repo_id, backfill_id")
+    .eq("job_id", jobId)
+    .single();
+
+  if (!selectWithMetadata.error) {
+    return { data: selectWithMetadata.data, error: null };
+  }
+
+  const message = selectWithMetadata.error.message || "";
+  if (!message.includes("repo_id") && !message.includes("backfill_id")) {
+    return selectWithMetadata;
+  }
+
+  const fallback = await supabaseAdmin
+    .from("report_jobs")
+    .select("commit_id, user_id")
+    .eq("job_id", jobId)
+    .single();
+
+  if (fallback.error || !fallback.data) {
+    return fallback;
+  }
+
+  return {
+    data: {
+      ...fallback.data,
+      repo_id: null,
+      backfill_id: null,
+    },
+    error: null,
+  };
+}
+
 export async function completeJob(
   supabaseAdmin,
   jobId,
@@ -404,11 +440,10 @@ export async function completeJob(
   metadata = {},
 ) {
   // Get the job info first
-  const { data: job, error: jobError } = await supabaseAdmin
-    .from("report_jobs")
-    .select("commit_id, user_id, repo_id, backfill_id")
-    .eq("job_id", jobId)
-    .single();
+  const { data: job, error: jobError } = await getReportJobByJobId(
+    supabaseAdmin,
+    jobId,
+  );
 
   if (jobError || !job) {
     return { success: false, error: "Job not found" };
@@ -1094,7 +1129,20 @@ export async function resetBackfillForRetry(supabaseAdmin, repoId, userId) {
       return { success: false, error: "No backfill job found" };
     }
 
-    if (backfill.status !== "failed" && backfill.status !== "partial") {
+    const hasQueuedPendingCommits = (backfill.commit_details || []).some(
+      (detail) => detail.status === "pending" && !detail.jobId,
+    );
+    const updatedAtMs = new Date(backfill.updated_at || backfill.created_at).getTime();
+    const isStaleQueuedBackfill =
+      backfill.status === "processing" &&
+      hasQueuedPendingCommits &&
+      Date.now() - updatedAtMs > 5 * 60 * 1000;
+
+    if (
+      backfill.status !== "failed" &&
+      backfill.status !== "partial" &&
+      !isStaleQueuedBackfill
+    ) {
       return {
         success: false,
         error: `Cannot retry backfill in '${backfill.status}' state`,
@@ -1103,7 +1151,7 @@ export async function resetBackfillForRetry(supabaseAdmin, repoId, userId) {
 
     // Reset failed commits to pending
     const details = backfill.commit_details.map((d) => {
-      if (d.status === "failed") {
+      if (d.status === "failed" || (isStaleQueuedBackfill && d.status === "pending" && !d.jobId)) {
         return { ...d, status: "pending", jobId: null, error: null };
       }
       return d;
@@ -1133,6 +1181,148 @@ export async function resetBackfillForRetry(supabaseAdmin, repoId, userId) {
   }
 }
 
+export async function recoverQueuedBackfills(supabaseAdmin, maxAgeHours = 2) {
+  const cutoffTime = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+  const results = { recovered: 0, failed: 0, errors: [] };
+
+  try {
+    const { data: backfills, error } = await supabaseAdmin
+      .from("backfill_jobs")
+      .select("*")
+      .eq("status", "processing")
+      .lt("updated_at", cutoffTime)
+      .order("created_at", { ascending: true })
+      .limit(25);
+
+    if (error) {
+      throw new Error(`Failed to fetch queued backfills: ${error.message}`);
+    }
+
+    const queuedBackfills = (backfills || []).filter((backfill) =>
+      (backfill.commit_details || []).some(
+        (detail) => detail.status === "pending" && !detail.jobId,
+      ),
+    );
+
+    if (queuedBackfills.length === 0) {
+      return results;
+    }
+
+    const stepper = await createStepperClient({
+      forceHttp: process.env.STEPPER_FORCE_HTTP === "true",
+      callbackUrl: `${
+        process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3001}`
+      }/v1/webhooks/report-completed`,
+      callbacks: [],
+    });
+
+    for (const backfill of queuedBackfills) {
+      const pendingDetails = (backfill.commit_details || []).filter(
+        (detail) => detail.status === "pending" && !detail.jobId,
+      );
+
+      for (const detail of pendingDetails) {
+        try {
+          const commit = await getCommitForReport(
+            supabaseAdmin,
+            detail.commitId,
+            backfill.user_id,
+          );
+
+          if (!commit) {
+            await updateBackfillCommitStatus(
+              supabaseAdmin,
+              backfill.id,
+              detail.commitId,
+              "failed",
+              null,
+              "Commit not found",
+            );
+            results.failed++;
+            continue;
+          }
+
+          const promptInput = {
+            userId: backfill.user_id,
+            commitSha: commit.sha,
+            repo: commit.repos?.name || "unknown",
+            message: commit.message || "",
+            files: (commit.files || []).map((file) => file.path || file),
+            components: commit.components || [],
+            diffSummary: commit.diff_summary || "",
+          };
+
+          const result = await stepper.enqueueReport(promptInput);
+
+          if (result.status === 202 && result.jobId) {
+            await createReportJob(supabaseAdmin, {
+              commitId: detail.commitId,
+              userId: backfill.user_id,
+              jobId: result.jobId,
+              repoId: backfill.repo_id,
+              backfillId: backfill.id,
+            });
+
+            await updateBackfillCommitStatus(
+              supabaseAdmin,
+              backfill.id,
+              detail.commitId,
+              "processing",
+              result.jobId,
+            );
+            results.recovered++;
+            continue;
+          }
+
+          if (result.status === 200 && result.cached) {
+            await saveCachedReport(
+              supabaseAdmin,
+              detail.commitId,
+              backfill.user_id,
+              result.data,
+              { provider: "cached", generationType: "backfill" },
+            );
+
+            await updateBackfillCommitStatus(
+              supabaseAdmin,
+              backfill.id,
+              detail.commitId,
+              "completed",
+            );
+            results.recovered++;
+            continue;
+          }
+
+          await updateBackfillCommitStatus(
+            supabaseAdmin,
+            backfill.id,
+            detail.commitId,
+            "failed",
+            null,
+            "Stepper did not return a queued job or cached report",
+          );
+          results.failed++;
+        } catch (error) {
+          await updateBackfillCommitStatus(
+            supabaseAdmin,
+            backfill.id,
+            detail.commitId,
+            "failed",
+            null,
+            error.message,
+          );
+          results.failed++;
+          results.errors.push(`Backfill ${backfill.id} commit ${detail.commitId}: ${error.message}`);
+        }
+      }
+    }
+  } catch (error) {
+    results.errors.push(`Queued backfill recovery: ${error.message}`);
+  }
+
+  return results;
+}
+
 /**
  * Recover stuck jobs that completed in Stepper but failed to save to database
  * @param {Object} supabaseAdmin - Supabase admin client
@@ -1145,6 +1335,14 @@ export async function recoverStuckJobs(supabaseAdmin, maxAgeHours = 2) {
   
   try {
     console.log(`🔄 Starting job recovery for jobs older than ${maxAgeHours} hours...`);
+
+    const queuedBackfillResults = await recoverQueuedBackfills(
+      supabaseAdmin,
+      maxAgeHours,
+    );
+    results.recovered += queuedBackfillResults.recovered;
+    results.failed += queuedBackfillResults.failed;
+    results.errors.push(...queuedBackfillResults.errors);
     
     // Find jobs stuck in "pending" state that are older than cutoff
     const { data: stuckJobs, error: fetchError } = await supabaseAdmin

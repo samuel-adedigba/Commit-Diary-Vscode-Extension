@@ -22,6 +22,7 @@ import {
 
 // Polling state
 let isPolling = false;
+let isRecovering = false;
 let pollIntervalId = null;
 let stepperInstance = null;
 let supabaseAdmin = null;
@@ -56,27 +57,13 @@ export function initCronPoller({
     60 * 60 * 1000,
   );
 
-  // Run job recovery every 30 minutes
-  setInterval(
-    async () => {
-      console.log('🔄 Running automatic job recovery...');
-      try {
-        const results = await recoverStuckJobs(supabaseAdmin, 2); // 2 hour cutoff
-        if (results.recovered > 0 || results.failed > 0) {
-          console.log(`📊 Recovery results: ${results.recovered} recovered, ${results.failed} failed`);
-        }
-        if (results.errors.length > 0) {
-          console.error(`⚠️ Recovery errors:`, results.errors);
-        }
-      } catch (error) {
-        console.error('❌ Automatic job recovery failed:', error);
-      }
-    },
-    30 * 60 * 1000, // 30 minutes
-  );
+  // Run job recovery every 30 minutes and once at startup so old completed
+  // Stepper jobs are saved after an API restart.
+  setInterval(runJobRecovery, 30 * 60 * 1000);
 
   // Run once immediately
   pollPendingJobs();
+  runJobRecovery();
 }
 
 /**
@@ -259,4 +246,26 @@ async function getJobFromStepper(jobId) {
  */
 export async function triggerPoll() {
   await pollPendingJobs();
+}
+
+async function runJobRecovery() {
+  if (isRecovering) {
+    return;
+  }
+
+  isRecovering = true;
+  console.log('🔄 Running automatic job recovery...');
+  try {
+    const results = await recoverStuckJobs(supabaseAdmin, 2); // 2 hour cutoff
+    if (results.recovered > 0 || results.failed > 0) {
+      console.log(`📊 Recovery results: ${results.recovered} recovered, ${results.failed} failed`);
+    }
+    if (results.errors.length > 0) {
+      console.error(`⚠️ Recovery errors:`, results.errors);
+    }
+  } catch (error) {
+    console.error('❌ Automatic job recovery failed:', error);
+  } finally {
+    isRecovering = false;
+  }
 }

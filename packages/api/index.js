@@ -41,6 +41,20 @@ const stepperInitPromise = initStepper().catch((error) => {
 
 const app = express();
 const port = process.env.PORT || 3001;
+const isDev = process.env.NODE_ENV !== "production";
+
+app.set("etag", false);
+
+function isTransientSupabaseError(err) {
+  if (!err) return false;
+  const message = err?.message || "";
+  const code = err?.code || err?.cause?.code;
+  return (
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    message.includes("fetch failed") ||
+    message.includes("timeout")
+  );
+}
 
 // CORS Configuration - Must be FIRST middleware
 const allowedOrigins = [
@@ -73,6 +87,25 @@ app.use((req, res, next) => {
 
   next();
 });
+
+app.use("/v1", (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
+if (isDev) {
+  app.use((req, res, next) => {
+    const startedAt = Date.now();
+    res.on("finish", () => {
+      console.log(
+        `[api] ${req.method} ${req.originalUrl || req.url} ${res.statusCode} ${Date.now() - startedAt}ms`,
+      );
+    });
+    next();
+  });
+}
 
 // Body parsing middleware - AFTER CORS
 // Custom middleware to handle both JSON and gzipped JSON
@@ -166,7 +199,17 @@ async function authMiddleware(req, res, next) {
           error,
         } = await supabaseAdmin.auth.getUser(token);
 
-        if (error || !user) {
+        if (error) {
+          if (isTransientSupabaseError(error)) {
+            return res.status(503).json({
+              error:
+                "Authentication service temporarily unavailable. Please try again.",
+              code: "SERVICE_UNAVAILABLE",
+            });
+          }
+          return res.status(401).json({ error: "Invalid or expired token" });
+        }
+        if (!user) {
           return res.status(401).json({ error: "Invalid or expired token" });
         }
 
@@ -186,11 +229,7 @@ async function authMiddleware(req, res, next) {
         }
       } catch (networkError) {
         // Handle network/timeout errors separately
-        if (
-          networkError.code === "UND_ERR_CONNECT_TIMEOUT" ||
-          networkError.message?.includes("fetch failed") ||
-          networkError.message?.includes("timeout")
-        ) {
+        if (isTransientSupabaseError(networkError)) {
           return res.status(503).json({
             error:
               "Authentication service temporarily unavailable. Please try again.",
@@ -714,15 +753,23 @@ app.get("/v1/users/:userId/commits", authMiddleware, async (req, res) => {
     }
 
     // Flatten repo_name and report status for the frontend
-    const commits = (rawCommits || []).map((commit) => ({
-      ...commit,
-      repo_name: commit.repos?.name || "Unknown Repository",
-      has_report: !!(commit.commit_reports && commit.commit_reports.length > 0),
-      report_generation_type:
-        commit.commit_reports?.[0]?.generation_type || null,
-      report_created_at: commit.commit_reports?.[0]?.created_at || null,
-      commit_reports: undefined, // Remove raw join data
-    }));
+    const commits = (rawCommits || []).map((commit) => {
+      const reportRows = Array.isArray(commit.commit_reports)
+        ? commit.commit_reports
+        : commit.commit_reports
+          ? [commit.commit_reports]
+          : [];
+      const latestReport = reportRows[0] || null;
+
+      return {
+        ...commit,
+        repo_name: commit.repos?.name || "Unknown Repository",
+        has_report: reportRows.length > 0,
+        report_generation_type: latestReport?.generation_type || null,
+        report_created_at: latestReport?.created_at || null,
+        commit_reports: undefined, // Remove raw join data
+      };
+    });
 
     res.json({
       commits,
@@ -1732,13 +1779,23 @@ app.post(
       // Find job info if commitId provided
       let jobInfo = null;
       if (commitId) {
-        const { data } = await supabaseAdmin
+        const { data, error } = await supabaseAdmin
           .from("report_jobs")
           .select("commit_id, user_id, repo_id, backfill_id")
           .eq("commit_id", commitId)
           .eq("user_id", req.userId)
           .single();
-        jobInfo = data;
+        if (error?.message?.includes("repo_id") || error?.message?.includes("backfill_id")) {
+          const { data: fallbackData } = await supabaseAdmin
+            .from("report_jobs")
+            .select("commit_id, user_id")
+            .eq("commit_id", commitId)
+            .eq("user_id", req.userId)
+            .single();
+          jobInfo = fallbackData ? { ...fallbackData, repo_id: null, backfill_id: null } : null;
+        } else {
+          jobInfo = data;
+        }
       }
 
       if (jobInfo) {

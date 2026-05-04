@@ -1,10 +1,81 @@
 export function createReportingController({ supabaseAdmin, getStepper, reportService }) {
+  const syncBackfillJobs = async (backfill) => {
+    const stepper = getStepper?.() || null;
+    if (!stepper || backfill?.status !== "processing") {
+      return backfill;
+    }
+
+    const activeDetails = (backfill.commit_details || []).filter(
+      (detail) => detail.status === "processing" && detail.jobId,
+    );
+
+    if (activeDetails.length === 0) {
+      return backfill;
+    }
+
+    for (const detail of activeDetails) {
+      try {
+        const stepperStatus = await stepper.getJob(detail.jobId);
+        const state = stepperStatus?.state || stepperStatus?.status;
+
+        if (state === "completed" && stepperStatus.result) {
+          const reportData = stepperStatus.result.result || stepperStatus.result;
+          const metadata = {
+            provider: stepperStatus.result.usedProvider,
+            generationTimeMs: stepperStatus.result.timings?.totalMs,
+            generationType: "backfill",
+          };
+
+          const saveResult = await reportService.completeJob(
+            supabaseAdmin,
+            detail.jobId,
+            reportData,
+            metadata,
+          );
+
+          if (saveResult.success) {
+            await reportService.updateBackfillCommitStatus(
+              supabaseAdmin,
+              backfill.id,
+              detail.commitId,
+              "completed",
+              detail.jobId,
+            );
+          }
+          continue;
+        }
+
+        if (state === "failed") {
+          const failedReason =
+            stepperStatus.failedReason || stepperStatus.error || "Stepper job failed";
+          await reportService.markJobFailed(supabaseAdmin, detail.jobId, failedReason);
+          await reportService.updateBackfillCommitStatus(
+            supabaseAdmin,
+            backfill.id,
+            detail.commitId,
+            "failed",
+            detail.jobId,
+            failedReason,
+          );
+        }
+      } catch (error) {
+        // Leave transient Stepper/API errors for the next poll.
+      }
+    }
+
+    return reportService.getBackfillStatus(
+      supabaseAdmin,
+      backfill.repo_id,
+      backfill.user_id,
+    );
+  };
+
   const getBackfillStatus = async (req, res) => {
     try {
       const parsedRepoId = parseInt(req.params.repoId, 10);
       const userId = req.userId;
 
-      const backfill = await reportService.getBackfillStatus(
+      let backfill = await reportService.getBackfillStatus(
         supabaseAdmin,
         parsedRepoId,
         userId,
@@ -13,6 +84,8 @@ export function createReportingController({ supabaseAdmin, getStepper, reportSer
       if (!backfill) {
         return res.json({ backfill: null });
       }
+
+      backfill = await syncBackfillJobs(backfill);
 
       const recoveryMeta = await reportService.getBackfillRecoveryMetadata(
         supabaseAdmin,

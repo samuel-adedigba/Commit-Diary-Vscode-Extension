@@ -443,11 +443,8 @@ export function createReportWebhooksRouter({ supabaseAdmin, reportService }) {
         }
 
         if (status === "completed" && result) {
-          const { data: jobInfo, error: jobError } = await supabaseAdmin
-            .from("report_jobs")
-            .select("commit_id, user_id, repo_id, backfill_id")
-            .eq("job_id", jobId)
-            .single();
+          const { data: jobInfo, error: jobError } =
+            await reportService.getReportJobByJobId(supabaseAdmin, jobId);
 
           if (jobError) {
             throw new Error(`Job lookup failed: ${jobError.message}`);
@@ -465,15 +462,6 @@ export function createReportWebhooksRouter({ supabaseAdmin, reportService }) {
           if (!saveResult.success) {
             throw new Error(`Database save failed: ${saveResult.error}`);
           }
-
-          try {
-            await sendDiscordNotification(supabaseAdmin, jobInfo.user_id, result, {
-              commitSha: req.body.metadata?.commitSha,
-              repo: req.body.metadata?.repo,
-              success: true,
-              jobId,
-            });
-          } catch (discordError) {}
 
           const backfill = await reportService.findActiveBackfillForCommit(
             supabaseAdmin,
@@ -494,27 +482,16 @@ export function createReportWebhooksRouter({ supabaseAdmin, reportService }) {
             );
           }
 
-          return { success: true, message: "Report saved and notifications sent" };
+          return { success: true, message: "Report saved" };
         }
 
         if (status === "failed" && error) {
-          const { data: jobInfo } = await supabaseAdmin
-            .from("report_jobs")
-            .select("commit_id, user_id, repo_id, backfill_id")
-            .eq("job_id", jobId)
-            .single();
+          const { data: jobInfo } = await reportService.getReportJobByJobId(
+            supabaseAdmin,
+            jobId,
+          );
 
           if (jobInfo) {
-            try {
-              await sendDiscordNotification(supabaseAdmin, jobInfo.user_id, null, {
-                commitSha: req.body.metadata?.commitSha,
-                repo: req.body.metadata?.repo,
-                success: false,
-                error,
-                jobId,
-              });
-            } catch (discordError) {}
-
             const backfill = await reportService.findActiveBackfillForCommit(
               supabaseAdmin,
               {
@@ -544,7 +521,7 @@ export function createReportWebhooksRouter({ supabaseAdmin, reportService }) {
           await reportService.markJobFailed(supabaseAdmin, jobId, error);
           return {
             success: true,
-            message: "Failure recorded and notifications sent",
+            message: "Failure recorded",
           };
         }
 
