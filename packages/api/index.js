@@ -1485,7 +1485,7 @@ app.delete("/v1/shares/:shareId", authMiddleware, async (req, res) => {
 app.get("/s/:username/:token", async (req, res) => {
   try {
     const { username, token } = req.params;
-    const { page = 1, limit = 50, repo } = req.query;
+    const { page = 1, limit = 50, repo, refresh } = req.query;
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
@@ -1551,7 +1551,9 @@ app.get("/s/:username/:token", async (req, res) => {
     if (snapshot && shareData.scope?.live) {
       const lastUpdate = new Date(snapshot.updated_at).getTime();
       const now = Date.now();
-      const needsRefresh = now - lastUpdate > 15 * 60 * 1000; // 15 minutes
+      const forceRefresh =
+        refresh === "1" || refresh === "true" || refresh === true;
+      const needsRefresh = forceRefresh || now - lastUpdate > 15 * 60 * 1000; // 15 minutes or explicit refresh
 
       if (needsRefresh) {
         try {
