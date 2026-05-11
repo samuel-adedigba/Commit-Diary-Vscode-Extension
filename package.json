@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "api": "pnpm --filter api start",
-    "dev": "pnpm --filter api start"
+    "api": "pnpm --filter @commitdiary/api start",
+    "dev": "pnpm --filter @commitdiary/api start"
   }
 }
