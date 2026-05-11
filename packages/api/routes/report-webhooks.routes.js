@@ -12,7 +12,7 @@ function validateWebhookSignature(req) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const bearerToken = authHeader.substring(7);
-    if (bearerToken === WEBHOOK_SECRET) {
+    if (timingSafeStringEqual(bearerToken, WEBHOOK_SECRET)) {
       return true;
     }
   }
@@ -20,7 +20,12 @@ function validateWebhookSignature(req) {
   const signature = req.headers["x-webhook-signature"];
   const timestamp = req.headers["x-webhook-timestamp"];
 
-  if (!signature || !timestamp) {
+  if (
+    typeof signature !== "string" ||
+    typeof timestamp !== "string" ||
+    !signature ||
+    !timestamp
+  ) {
     return false;
   }
 
@@ -36,7 +41,19 @@ function validateWebhookSignature(req) {
     .update(payloadString)
     .digest("hex");
 
-  return signature === expectedSignature;
+  return timingSafeStringEqual(signature, expectedSignature);
+}
+
+function timingSafeStringEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") {
+    return false;
+  }
+  const aBuffer = Buffer.from(a, "utf8");
+  const bBuffer = Buffer.from(b, "utf8");
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
 }
 
 async function sendDiscordNotification(supabaseAdmin, userId, result, options) {
@@ -196,6 +213,10 @@ export function createReportWebhooksRouter({ supabaseAdmin, reportService }) {
 
   router.post("/v1/stepper/callback", express.json(), async (req, res) => {
     try {
+      if (!validateWebhookSignature(req)) {
+        return res.status(401).json({ success: false, error: "Invalid webhook signature" });
+      }
+
       const { success, result, error, metadata } = req.body;
       const { userId, commitSha, repo, jobId, provider, generationTimeMs, timestamp } =
         metadata || {};

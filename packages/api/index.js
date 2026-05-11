@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import zlib from "zlib";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import helmet from "helmet";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -44,6 +45,7 @@ const port = process.env.PORT || 3001;
 const isDev = process.env.NODE_ENV !== "production";
 
 app.set("etag", false);
+app.use(helmet());
 
 function isTransientSupabaseError(err) {
   if (!err) return false;
@@ -361,6 +363,14 @@ function checkRateLimit(shareId, ipAddress) {
   // Consume one token
   bucket.tokens -= 1;
   return true;
+}
+
+function parsePositiveInt(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed)) {
+    return fallback;
+  }
+  return Math.min(Math.max(parsed, min), max);
 }
 
 // Routes
@@ -713,6 +723,8 @@ app.get("/v1/users/:userId/commits", authMiddleware, async (req, res) => {
     }
 
     const { from, to, limit = 50, offset = 0, category, search } = req.query;
+    const parsedLimit = parsePositiveInt(limit, 50, { min: 1, max: 200 });
+    const parsedOffset = parsePositiveInt(offset, 0, { min: 0, max: 100000 });
 
     // Build base query for both count and data
     // Include commit_reports to show report status alongside commits
@@ -744,7 +756,7 @@ app.get("/v1/users/:userId/commits", authMiddleware, async (req, res) => {
     // Execute query with pagination
     const query = baseQuery
       .order("date", { ascending: false })
-      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+      .range(parsedOffset, parsedOffset + parsedLimit - 1);
 
     const { data: rawCommits, error, count } = await query;
 
